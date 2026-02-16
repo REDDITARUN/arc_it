@@ -74,22 +74,29 @@ pip install -r requirements.txt
 
 ### 4. Download reference datasets
 
-The ARC-AGI datasets are required but not included in the repo:
+The ARC-AGI datasets are required but not included in the repo. Use the setup script:
 
 ```bash
-mkdir -p References
-cd References
+bash scripts/setup_data.sh
+```
 
-# ARC-AGI-1 (800 tasks)
-git clone https://github.com/fchollet/ARC-AGI.git
+Or manually:
 
-# ARC-AGI-2 (1120 tasks)
-git clone https://github.com/arcprize/ARC-AGI-2.git
-
+```bash
+mkdir -p References && cd References
+git clone --depth 1 https://github.com/fchollet/ARC-AGI.git
+git clone --depth 1 https://github.com/arcprize/ARC-AGI-2.git
 cd ..
 ```
 
-### 5. (Optional) Download reference repositories for study
+### 5. Configure API keys (for training + model upload)
+
+```bash
+cp .env.example .env
+# Edit .env with your WANDB_API_KEY and HF_TOKEN
+```
+
+### 6. (Optional) Download reference repositories for study
 
 ```bash
 cd References
@@ -110,6 +117,19 @@ git clone https://github.com/NVIDIA/NVARC.git
 git clone https://github.com/ARChitectsDev/ARC2025_Solution_by_the_ARChitects.git
 
 cd ..
+```
+
+## Cloud Quickstart (H100 / Colab)
+
+One-shot setup on a fresh cloud machine:
+
+```bash
+git clone https://github.com/REDDITARUN/arc_it.git && cd arc_it
+pip install -r requirements.txt
+bash scripts/setup_data.sh
+cp .env.example .env
+# Edit .env with your WANDB_API_KEY and HF_TOKEN
+python scripts/train.py --wandb --push-to-hf
 ```
 
 ## Quick Start
