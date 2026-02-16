@@ -1,0 +1,25 @@
+# ARC-IT: Core dependencies
+# Install: pip install -r requirements.txt
+
+# Core ML
+torch>=2.2.0
+torchvision>=0.17.0
+numpy>=1.24.0
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Pretrained models
+timm>=0.9.12
+huggingface-hub>=0.20.0
+
+# Training utilities
+tqdm>=4.65.0
+wandb>=0.16.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Testing
+pytest>=7.4.0

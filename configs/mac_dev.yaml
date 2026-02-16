@@ -1,0 +1,28 @@
+# ARC-IT Mac Development Override
+# Small batch sizes, CPU/MPS, fast iteration
+
+training:
+  batch_size: 4
+  num_workers: 0
+  epochs: 3
+  gradient_checkpointing: false
+
+  stage1:
+    epochs: 1
+    batch_size_override: 8
+
+  stage2:
+    epochs: 2
+
+  stage3:
+    epochs: 1
+
+model:
+  sana:
+    pretrained_path: null        # Skip loading large checkpoint for dev
+
+ttt:
+  steps: 10
+  batch_size: 2
+  num_candidates: 4
+  num_denoising_steps: 10

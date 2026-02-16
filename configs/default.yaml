@@ -1,0 +1,119 @@
+# ARC-IT Default Configuration
+# Auto-adapts to Mac (dev) vs H100 (training) based on device detection
+
+# ─── Data ───────────────────────────────────────────────────────────
+data:
+  arc_agi1_path: "References/ARC-AGI"
+  arc_agi2_path: "References/ARC-AGI-2"
+  canvas_size: 64                # Fixed canvas for all grids (VARC-proven)
+  num_colors: 12                 # 10 ARC + IGNORE + PAD
+  max_grid_size: 30              # Max raw grid dimension
+
+  augmentation:
+    geometric: true              # 8 variants (rotations + flips + transpose)
+    color_permutation: true      # Random color remapping
+    num_color_perms: 10          # Color permutations per geometric variant
+    keep_background: true        # Keep color 0 (black) fixed during permutation
+    resolution_scaling: true     # Random upscale within canvas
+    translation: true            # Random position offset in canvas
+
+# ─── Model ──────────────────────────────────────────────────────────
+model:
+  # JEPA/DINOv2 Encoder (FROZEN)
+  encoder:
+    name: "dinov2_vitl14"        # DINOv2-L/14: embed_dim=1024, 256 patches
+    pretrained: true
+    frozen: true
+    input_size: 224              # DINOv2 expects 224x224
+    embed_dim: 1024              # Output embedding dimension
+    num_patches: 256             # (224/14)^2
+
+  # Bridge Module (TRAINABLE)
+  bridge:
+    hidden_dim: 2048             # Intermediate expansion
+    output_dim: 1152             # Must match Sana hidden_size
+    dropout: 0.1
+    use_2d_pos_embed: true       # Learnable 16x16 positional embeddings
+
+  # Sana Transformer Backbone (TRAINABLE)
+  sana:
+    hidden_size: 1152            # Sana-0.6B native size
+    depth: 28                    # Number of transformer blocks
+    num_heads: 16                # Attention heads
+    linear_head_dim: 32          # For linear attention (LiteLA)
+    mlp_ratio: 2.5               # FFN expansion ratio
+    attn_type: "linear"          # linear | flash
+    ffn_type: "glumbconv"        # glumbconv | mlp
+    pretrained_path: null        # Path to Sana-0.6B checkpoint (null = random init)
+
+  # Spatial Decoder (TRAINABLE)
+  decoder:
+    upsample_method: "transposed_conv"  # transposed_conv | interpolate
+    hidden_channels: [512, 256]         # Channel sizes for upsampling layers
+
+  # Diffusion
+  diffusion:
+    num_train_timesteps: 1000
+    num_inference_steps: 50      # Denoising steps at inference
+    noise_schedule: "linear"     # linear | cosine
+    prediction_type: "epsilon"   # epsilon | v_prediction
+
+# ─── Training ───────────────────────────────────────────────────────
+training:
+  # Auto-scaled by device (these are H100 defaults)
+  batch_size: 64                 # Mac override: 4
+  num_workers: 8                 # Mac override: 0
+  epochs: 30
+  gradient_clip: 1.0
+  gradient_checkpointing: true   # Mac: false (not needed)
+
+  # Three-stage schedule
+  stage1:
+    name: "bridge_alignment"
+    epochs: 5
+    lr: 1.0e-4
+    freeze_sana: true
+    batch_size_override: 256     # Mac: 8
+
+  stage2:
+    name: "full_training"
+    epochs: 20
+    lr: 5.0e-5
+    freeze_sana: false
+
+  stage3:
+    name: "hard_focus"
+    epochs: 5
+    lr: 1.0e-5
+    freeze_sana: false
+    agi2_oversample: 2.0         # 2x weight on AGI-2 tasks
+
+  optimizer:
+    name: "adamw"
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_ratio: 0.1
+
+  # Logging
+  log_every_n_steps: 100
+  save_every_n_epochs: 1
+  checkpoint_dir: "checkpoints"
+
+# ─── Test-Time Training ─────────────────────────────────────────────
+ttt:
+  enabled: true
+  steps: 100                     # Fine-tuning steps per task
+  lr: 1.0e-4
+  batch_size: 8                  # Mac: 2
+  num_layers_to_update: 4        # Last N Sana layers
+  num_candidates: 32             # Multi-sample generation
+  num_denoising_steps: 50        # Per candidate
+
+# ─── Evaluation ─────────────────────────────────────────────────────
+evaluation:
+  val_split_ratio: 0.1           # Hold out 10% for validation
+  metrics: ["pixel_accuracy", "grid_exact_match"]
+  visualize_every_n_tasks: 50

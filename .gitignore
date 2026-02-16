@@ -1,0 +1,51 @@
+# Reference repositories (large, download separately)
+References/
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Weights and checkpoints (download separately)
+checkpoints/
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+*.safetensors
+
+# Data artifacts (generated, not committed)
+data_augmented/
+outputs/
+logs/
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
