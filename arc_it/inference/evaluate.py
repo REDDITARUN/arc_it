@@ -6,6 +6,7 @@ Evaluates model on ARC-AGI tasks with metrics:
     - per_difficulty: breakdown by AGI-1 vs AGI-2
 
 Can run with or without test-time training (TTT).
+Includes tqdm progress bars for all evaluation loops.
 """
 
 import json
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from arc_it.data.canvas import IGNORE_INDEX, crop_prediction_from_canvas
 from arc_it.data.dataset import ARCDataset, collate_fn
@@ -41,16 +43,7 @@ class Evaluator:
         batch_size: int = 4,
         num_workers: int = 0,
     ) -> Dict[str, Any]:
-        """Evaluate model on an entire dataset.
-
-        Args:
-            dataset: ARCDataset configured for evaluation (no augmentation).
-            batch_size: Evaluation batch size.
-            num_workers: DataLoader workers.
-
-        Returns:
-            Dict with aggregate metrics and per-task results.
-        """
+        """Evaluate model on an entire dataset with progress bar."""
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -66,7 +59,9 @@ class Evaluator:
         total_exact_match = 0
         total_time = 0.0
 
-        for batch in loader:
+        pbar = tqdm(loader, desc="Evaluating", dynamic_ncols=True)
+
+        for batch in pbar:
             t_start = time.time()
 
             input_rgb = batch["input_rgb_224"].to(self.device)
@@ -77,7 +72,6 @@ class Evaluator:
 
             t_elapsed = time.time() - t_start
 
-            # Per-sample metrics
             for i in range(prediction.shape[0]):
                 pred_i = prediction[i]
                 target_i = target[i]
@@ -92,7 +86,6 @@ class Evaluator:
                 total_grids += 1
                 total_exact_match += int(exact_match)
 
-                # Crop prediction back to original grid
                 offset = batch["offset"][i]
                 scale = batch["scale_factor"][i].item()
                 pred_grid = crop_prediction_from_canvas(
@@ -109,8 +102,16 @@ class Evaluator:
                 })
 
             total_time += t_elapsed
+            pixel_acc_so_far = total_correct_pixels / max(total_pixels, 1)
+            grid_match_so_far = total_exact_match / max(total_grids, 1)
+            pbar.set_postfix(
+                px_acc=f"{pixel_acc_so_far:.3f}",
+                grid_match=f"{grid_match_so_far:.3f}",
+                grids=total_grids,
+            )
 
-        # Aggregate
+        pbar.close()
+
         pixel_acc = total_correct_pixels / max(total_pixels, 1)
         grid_match = total_exact_match / max(total_grids, 1)
 
@@ -129,14 +130,7 @@ class Evaluator:
         self,
         input_rgb_224: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict on a single input grid.
-
-        Args:
-            input_rgb_224: (1, 3, 224, 224) or (3, 224, 224) normalized RGB.
-
-        Returns:
-            (64, 64) integer prediction tensor.
-        """
+        """Predict on a single input grid."""
         if input_rgb_224.dim() == 3:
             input_rgb_224 = input_rgb_224.unsqueeze(0)
         input_rgb_224 = input_rgb_224.to(self.device)

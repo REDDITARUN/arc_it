@@ -23,6 +23,7 @@ load_dotenv()
 
 import json
 import torch
+from tqdm import tqdm
 from arc_it.utils.config import load_config
 from arc_it.utils.device import device_info
 from arc_it.data.dataset import ARCDataset
@@ -54,7 +55,6 @@ def main():
     data_roots = [data_cfg["arc_agi1_path"], data_cfg["arc_agi2_path"]]
 
     if args.ttt:
-        # TTT mode: evaluate per-task with fine-tuning
         ttt_cfg = config.get("ttt", {})
         ttt = TestTimeTrainer(
             model=model,
@@ -65,11 +65,8 @@ def main():
             num_candidates=ttt_cfg.get("num_candidates", 32),
             canvas_size=data_cfg["canvas_size"],
         )
-
-        # Load raw tasks for TTT
         results = evaluate_with_ttt(ttt, data_roots, args.split)
     else:
-        # Standard evaluation
         dataset = ARCDataset(
             data_roots=data_roots,
             split=args.split,
@@ -97,7 +94,7 @@ def main():
 
 
 def evaluate_with_ttt(ttt, data_roots, split):
-    """Evaluate with TTT: load raw tasks and predict each."""
+    """Evaluate with TTT: load raw tasks and predict each with progress bar."""
     from pathlib import Path
     import time
 
@@ -105,30 +102,44 @@ def evaluate_with_ttt(ttt, data_roots, split):
     total_tasks = 0
     t_start = time.time()
 
+    # Collect all task files first for progress bar
+    all_task_files = []
     for root in data_roots:
         split_dir = Path(root) / "data" / split
         if not split_dir.exists():
             continue
-        for task_file in sorted(split_dir.glob("*.json")):
-            with open(task_file) as f:
-                task = json.load(f)
+        all_task_files.extend(sorted(split_dir.glob("*.json")))
 
-            predictions = ttt.predict_task(task, num_attempts=2)
+    pbar = tqdm(all_task_files, desc="TTT Evaluation", dynamic_ncols=True)
 
-            # Check if any prediction matches ground truth
-            for test_ex in task.get("test", []):
-                gt = test_ex.get("output")
-                if gt is None:
-                    continue
-                total_tasks += 1
-                for pred in predictions:
-                    if pred == gt:
-                        total_correct += 1
-                        break
+    for task_file in pbar:
+        with open(task_file) as f:
+            task = json.load(f)
+
+        predictions = ttt.predict_task(task, num_attempts=2)
+
+        for test_ex in task.get("test", []):
+            gt = test_ex.get("output")
+            if gt is None:
+                continue
+            total_tasks += 1
+            for pred in predictions:
+                if pred == gt:
+                    total_correct += 1
+                    break
+
+        acc = total_correct / max(total_tasks, 1)
+        pbar.set_postfix(
+            correct=total_correct,
+            total=total_tasks,
+            acc=f"{acc:.3f}",
+        )
+
+    pbar.close()
 
     total_time = time.time() - t_start
     return {
-        "pixel_accuracy": 0.0,  # N/A for TTT mode
+        "pixel_accuracy": 0.0,
         "grid_exact_match": total_correct / max(total_tasks, 1),
         "total_grids": total_tasks,
         "total_exact_match": total_correct,

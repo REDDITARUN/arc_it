@@ -8,6 +8,7 @@ data:
   canvas_size: 64                # Fixed canvas for all grids (VARC-proven)
   num_colors: 12                 # 10 ARC + IGNORE + PAD
   max_grid_size: 30              # Max raw grid dimension
+  repeat_factor: 16              # Multiply dataset size (on-the-fly augmentation makes each unique)
 
   augmentation:
     geometric: true              # 8 variants (rotations + flips + transpose)
@@ -19,13 +20,13 @@ data:
 
 # ─── Model ──────────────────────────────────────────────────────────
 model:
-  # JEPA/DINOv2 Encoder (FROZEN)
+  # I-JEPA Encoder (FROZEN) — better for spatial/abstract reasoning than DINOv2
   encoder:
-    name: "dinov2_vitl14"        # DINOv2-L/14: embed_dim=1024, 256 patches
+    name: "ijepa_vith14_1k"      # I-JEPA ViT-H/14 trained on ImageNet-1K
     pretrained: true
     frozen: true
-    input_size: 224              # DINOv2 expects 224x224
-    embed_dim: 1024              # Output embedding dimension
+    input_size: 224              # ViT expects 224x224
+    embed_dim: 1280              # ViT-H output embedding dimension
     num_patches: 256             # (224/14)^2
 
   # Bridge Module (TRAINABLE)
@@ -44,7 +45,7 @@ model:
     mlp_ratio: 2.5               # FFN expansion ratio
     attn_type: "linear"          # linear | flash
     ffn_type: "glumbconv"        # glumbconv | mlp
-    pretrained_path: null        # Path to Sana-0.6B checkpoint (null = random init)
+    pretrained: true             # Load Sana-0.6B pretrained weights
 
   # Spatial Decoder (TRAINABLE)
   decoder:
@@ -56,7 +57,7 @@ model:
     num_train_timesteps: 1000
     num_inference_steps: 50      # Denoising steps at inference
     noise_schedule: "linear"     # linear | cosine
-    prediction_type: "epsilon"   # epsilon | v_prediction
+    prediction_type: "x0"        # x0 prediction (not epsilon)
 
 # ─── Training ───────────────────────────────────────────────────────
 training:
@@ -73,7 +74,6 @@ training:
     epochs: 5
     lr: 1.0e-4
     freeze_sana: true
-    batch_size_override: 256     # Mac: 8
 
   stage2:
     name: "full_training"
@@ -97,9 +97,9 @@ training:
     name: "cosine"
     warmup_ratio: 0.1
 
-  # Logging
+  # Logging & Checkpointing
   log_every_n_steps: 100
-  save_every_n_epochs: 1
+  save_every_n_epochs: 5         # Save checkpoints less frequently
   checkpoint_dir: "checkpoints"
 
 # ─── Test-Time Training ─────────────────────────────────────────────

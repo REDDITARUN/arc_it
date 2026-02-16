@@ -2,12 +2,11 @@
 
 Implements a simple linear noise schedule for training and inference.
 During training, noise is added to output grid embeddings and the model
-learns to denoise. During inference, we start from pure noise and
-iteratively denoise to produce the output grid.
+learns to denoise (x_0 prediction). During inference, we support both
+single-step prediction and multi-step DDPM with x_0 parameterization.
 
-This is a minimal, clean implementation suitable for our discrete-output
-use case. The continuous diffusion operates on patch embeddings, and we
-apply CrossEntropy loss on the decoded discrete logits.
+The model predicts x_0 directly (not epsilon), so inference uses the
+DDPM posterior formula for x_0 prediction.
 """
 
 import torch
@@ -15,7 +14,7 @@ import torch.nn as nn
 
 
 class DiffusionScheduler(nn.Module):
-    """Linear noise schedule for training and inference."""
+    """Linear noise schedule with x_0 prediction for training and inference."""
 
     def __init__(
         self,
@@ -26,17 +25,24 @@ class DiffusionScheduler(nn.Module):
         super().__init__()
         self.num_train_timesteps = num_train_timesteps
 
-        # Linear beta schedule
         betas = torch.linspace(beta_start, beta_end, num_train_timesteps)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
+        # Prepend alpha_bar_0 = 1.0 for the posterior at t=1
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
+
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
         self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
-        self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
+
+        # Posterior variance: beta_tilde_t = beta_t * (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_variance = torch.clamp(posterior_variance, min=1e-20)
+        self.register_buffer("posterior_variance", posterior_variance)
 
     def add_noise(
         self,
@@ -44,18 +50,7 @@ class DiffusionScheduler(nn.Module):
         noise: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward diffusion: add noise to clean samples.
-
-        q(x_t | x_0) = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
-
-        Args:
-            x_0: (B, N, C) clean patch embeddings.
-            noise: (B, N, C) Gaussian noise (same shape as x_0).
-            timesteps: (B,) integer timesteps.
-
-        Returns:
-            (B, N, C) noisy patch embeddings at time t.
-        """
+        """Forward diffusion: q(x_t | x_0) = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise"""
         sqrt_alpha = self.sqrt_alphas_cumprod[timesteps][:, None, None]
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[timesteps][:, None, None]
         return sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
@@ -65,38 +60,36 @@ class DiffusionScheduler(nn.Module):
         return torch.randint(0, self.num_train_timesteps, (batch_size,), device=device)
 
     @torch.no_grad()
-    def denoise_step(
+    def denoise_step_x0(
         self,
-        model_output: torch.Tensor,
+        x_0_pred: torch.Tensor,
         x_t: torch.Tensor,
         t: int,
     ) -> torch.Tensor:
-        """Single DDPM denoising step: x_t -> x_{t-1}.
+        """Single DDPM denoising step with x_0 prediction: x_t -> x_{t-1}.
 
-        Args:
-            model_output: (B, N, C) predicted noise from the Sana backbone.
-            x_t: (B, N, C) current noisy state.
-            t: Current timestep (integer).
-
-        Returns:
-            (B, N, C) slightly less noisy state x_{t-1}.
+        Uses the DDPM posterior mean formula for x_0 parameterization:
+        mu_posterior = (sqrt(alpha_bar_{t-1}) * beta_t / (1-alpha_bar_t)) * x_0_pred
+                     + (sqrt(alpha_t) * (1-alpha_bar_{t-1}) / (1-alpha_bar_t)) * x_t
         """
-        alpha_t = self.alphas[t]
+        if t == 0:
+            return x_0_pred
+
         alpha_bar_t = self.alphas_cumprod[t]
+        alpha_bar_t_prev = self.alphas_cumprod_prev[t]
+        alpha_t = self.alphas[t]
         beta_t = self.betas[t]
 
-        # Predict x_0 from noise prediction
-        sqrt_recip_alpha = self.sqrt_recip_alphas[t]
-        pred_mean = sqrt_recip_alpha * (
-            x_t - beta_t / self.sqrt_one_minus_alphas_cumprod[t] * model_output
-        )
+        # Posterior mean coefficients
+        coeff_x0 = torch.sqrt(alpha_bar_t_prev) * beta_t / (1.0 - alpha_bar_t)
+        coeff_xt = torch.sqrt(alpha_t) * (1.0 - alpha_bar_t_prev) / (1.0 - alpha_bar_t)
 
-        if t > 0:
-            noise = torch.randn_like(x_t)
-            sigma = torch.sqrt(beta_t)
-            return pred_mean + sigma * noise
-        else:
-            return pred_mean
+        posterior_mean = coeff_x0 * x_0_pred + coeff_xt * x_t
+
+        # Add noise scaled by posterior variance
+        noise = torch.randn_like(x_t)
+        posterior_std = torch.sqrt(self.posterior_variance[t])
+        return posterior_mean + posterior_std * noise
 
     @torch.no_grad()
     def inference_loop(
@@ -107,31 +100,43 @@ class DiffusionScheduler(nn.Module):
         num_inference_steps: int = 50,
         device: torch.device = None,
     ) -> torch.Tensor:
-        """Full denoising loop from pure noise to clean output.
+        """Full denoising loop from pure noise to clean output (x_0 prediction).
 
-        Args:
-            denoise_fn: Callable(x_t, conditioning, timestep) -> noise prediction.
-            shape: (B, N, C) shape of the output.
-            conditioning: (B, M, C) encoder conditioning.
-            num_inference_steps: Number of denoising steps.
-            device: Target device.
-
-        Returns:
-            (B, N, C) denoised patch embeddings.
+        The denoise_fn is expected to predict x_0 directly (not epsilon).
         """
         if device is None:
             device = conditioning.device
 
-        # Start from pure noise
         x = torch.randn(shape, device=device)
 
-        # Evenly spaced timesteps for inference
-        step_size = self.num_train_timesteps // num_inference_steps
+        step_size = max(self.num_train_timesteps // num_inference_steps, 1)
         timesteps = list(range(self.num_train_timesteps - 1, -1, -step_size))
 
         for t in timesteps:
             t_tensor = torch.full((shape[0],), t, device=device, dtype=torch.long)
-            noise_pred = denoise_fn(x, conditioning, t_tensor)
-            x = self.denoise_step(noise_pred, x, t)
+            x_0_pred = denoise_fn(x, conditioning, t_tensor)
+            x = self.denoise_step_x0(x_0_pred, x, t)
 
         return x
+
+    @torch.no_grad()
+    def single_step_predict(
+        self,
+        denoise_fn,
+        shape: tuple,
+        conditioning: torch.Tensor,
+        device: torch.device = None,
+    ) -> torch.Tensor:
+        """Single-step prediction: pass noise at max timestep, get x_0 directly.
+
+        This is faster than the full loop and works well because the model
+        is trained to predict x_0 from any noise level, and at t=T-1 the
+        conditioning signal dominates the prediction.
+        """
+        if device is None:
+            device = conditioning.device
+
+        noise = torch.randn(shape, device=device)
+        t_max = self.num_train_timesteps - 1
+        t_tensor = torch.full((shape[0],), t_max, device=device, dtype=torch.long)
+        return denoise_fn(noise, conditioning, t_tensor)

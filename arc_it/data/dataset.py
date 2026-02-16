@@ -38,6 +38,11 @@ class ARCDataset(Dataset):
 
     Each sample is a single (input_grid, output_grid) pair from a task.
     Augmentations are applied on-the-fly per __getitem__ call.
+
+    The `repeat_factor` multiplies the effective dataset size. Since
+    augmentation is random on each access, every repeated sample gets
+    a different geometric/color augmentation, effectively expanding
+    the dataset.
     """
 
     def __init__(
@@ -53,6 +58,7 @@ class ARCDataset(Dataset):
         keep_background: bool = True,
         difficulty_labels: Optional[Dict[str, float]] = None,
         seed: int = 42,
+        repeat_factor: int = 1,
     ) -> None:
         """
         Args:
@@ -143,13 +149,18 @@ class ARCDataset(Dataset):
             )
 
         self.num_tasks = len(self.task_lookup)
-        print(f"Loaded {len(self.samples)} samples from {self.num_tasks} tasks")
+        self.repeat_factor = max(1, repeat_factor)
+        raw_count = len(self.samples)
+        effective = raw_count * self.repeat_factor
+        print(f"Loaded {raw_count} samples from {self.num_tasks} tasks "
+              f"(repeat={self.repeat_factor}x → {effective} effective)")
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.samples) * self.repeat_factor
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = self.samples[idx]
+        real_idx = idx % len(self.samples)
+        sample = self.samples[real_idx]
         example = sample["example"]
         input_grid = example["input"]
         output_grid = example.get("output")
@@ -272,6 +283,8 @@ def build_dataloaders(
     canvas_size = data_cfg["canvas_size"]
     aug_cfg = data_cfg["augmentation"]
 
+    repeat_factor = data_cfg.get("repeat_factor", 1)
+
     train_dataset = ARCDataset(
         data_roots=data_roots,
         split="training",
@@ -282,6 +295,7 @@ def build_dataloaders(
         enable_resolution=aug_cfg["resolution_scaling"],
         num_color_perms=aug_cfg["num_color_perms"],
         keep_background=aug_cfg["keep_background"],
+        repeat_factor=repeat_factor,
     )
 
     train_loader = DataLoader(

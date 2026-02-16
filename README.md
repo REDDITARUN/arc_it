@@ -1,11 +1,12 @@
-# ARC-IT: JEPA + Sana Hybrid for ARC-AGI
+# ARC-IT: I-JEPA + Sana Hybrid for ARC-AGI
 
 A hybrid neural architecture that solves abstract reasoning tasks (ARC-AGI) by combining:
 
-- **JEPA/DINOv2 Encoder (Frozen)** - Pretrained spatial feature extractor
+- **I-JEPA Encoder (Frozen)** - Meta's self-supervised ViT-H/14 for spatial reasoning
 - **Bridge Module (Trainable)** - Maps encoder features to diffusion space
-- **Sana Transformer (Trainable)** - Linear-attention diffusion backbone for iterative refinement
+- **Sana-0.6B Transformer (Trainable, Pretrained)** - Linear-attention diffusion backbone with pretrained weights
 - **Spatial Decoder (Trainable)** - Converts transformer output to discrete ARC grids
+- **Test-Time Training (TTT)** - Per-task adaptation for each puzzle
 
 ## Architecture
 
@@ -16,13 +17,13 @@ Input Grid (variable size, up to 30x30)
 Pad to 64x64 Canvas → Render as RGB → Upsample to 224x224
     |
     v
-DINOv2-L/14 Encoder (FROZEN) → Patch features [B, 256, 1024]
+I-JEPA ViT-H/14 Encoder (FROZEN) → Patch features [B, 256, 1280]
     |
     v
 Bridge Module (TRAINABLE) → [B, 256, 1152]
     |
     v
-Sana Transformer (TRAINABLE) → Iterative denoising, conditioned on encoder features
+Sana-0.6B Transformer (TRAINABLE, pretrained) → x_0 prediction, conditioned on encoder
     |
     v
 Spatial Decoder (TRAINABLE) → [B, 12, 64, 64] logits

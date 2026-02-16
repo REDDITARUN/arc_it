@@ -2,8 +2,7 @@
 
 Per-task adaptation: for each evaluation task, fine-tune the model
 on the task's demonstration examples (2-5 input/output pairs) before
-making predictions. This is the key technique used by ALL top ARC
-solutions (VARC, ARChitects, NVARC).
+making predictions. Includes tqdm progress bars for all loops.
 
 Workflow per task:
     1. Snapshot model weights
@@ -11,9 +10,6 @@ Workflow per task:
     3. Fine-tune last N Sana layers + Bridge + Decoder for K steps
     4. Generate predictions (optionally with multi-sample)
     5. Restore original weights for next task
-
-Key hyperparameters (defaults from VARC):
-    steps=100, lr=1e-4, batch_size=8, layers_to_update=4
 """
 
 import copy
@@ -25,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 from arc_it.data.augmentation import (
     get_geometric_augmentations,
@@ -76,39 +73,22 @@ class TestTimeTrainer:
         task: Dict[str, Any],
         num_attempts: int = 2,
     ) -> List[List[List[int]]]:
-        """Predict test output(s) for a single ARC task with TTT.
-
-        Args:
-            task: ARC task dict with "train" (demos) and "test" (inputs).
-            num_attempts: Number of predictions to return (ARC allows 2).
-
-        Returns:
-            List of predicted grids (each a 2D list of integers).
-        """
-        # 1. Snapshot weights
+        """Predict test output(s) for a single ARC task with TTT."""
         snapshot = self._snapshot_weights()
-
-        # 2. Prepare augmented training data from demonstrations
         train_data = self._prepare_ttt_data(task["train"])
-
-        # 3. Fine-tune
         self._fine_tune(train_data)
 
-        # 4. Generate predictions
         predictions = []
         for test_example in task["test"]:
             candidates = self._generate_candidates(
                 test_example["input"],
                 num_candidates=self.num_candidates,
             )
-            # Score and pick top predictions
             scored = self._score_candidates(candidates)
             top = scored[:num_attempts]
             predictions.extend(top)
 
-        # 5. Restore weights
         self._restore_weights(snapshot)
-
         return predictions[:num_attempts]
 
     # ─── TTT Data Preparation ────────────────────────────────────
@@ -117,10 +97,7 @@ class TestTimeTrainer:
         self,
         train_examples: List[Dict],
     ) -> Dict[str, torch.Tensor]:
-        """Create augmented training batches from demonstration examples.
-
-        Applies geometric + color augmentation to each demo pair.
-        """
+        """Create augmented training batches from demonstration examples."""
         rng = np.random.RandomState(42)
         geos = get_geometric_augmentations()
 
@@ -132,23 +109,19 @@ class TestTimeTrainer:
             out = example["output"]
 
             for geo_name, geo_fn in geos:
-                # Apply geometric augmentation
                 aug_inp = geo_fn(inp)
                 aug_out = geo_fn(out)
 
-                # Apply color permutation
                 perm = random_color_permutation(rng, keep_background=True)
                 aug_inp = permute_colors(aug_inp, perm)
                 aug_out = permute_colors(aug_out, perm)
 
-                # Compute canvas dimensions
                 h_in, w_in = len(aug_inp), len(aug_inp[0])
                 h_out, w_out = len(aug_out), len(aug_out[0])
                 max_h, max_w = max(h_in, h_out), max(w_in, w_out)
 
                 x_off, y_off = random_offset(max_h, max_w, self.canvas_size, rng)
 
-                # Create canvases
                 input_canvas, _, _, _ = pad_grid_to_canvas(
                     aug_inp, self.canvas_size, x_off, y_off, mark_boundary=False
                 )
@@ -170,10 +143,8 @@ class TestTimeTrainer:
     # ─── Fine-tuning ─────────────────────────────────────────────
 
     def _fine_tune(self, train_data: Dict[str, torch.Tensor]) -> None:
-        """Fine-tune model on augmented demonstration data."""
+        """Fine-tune model on augmented demonstration data with progress bar."""
         self.model.train()
-
-        # Only update last N Sana layers + bridge + decoder
         self._set_ttt_trainable()
 
         params = [p for p in self.model.parameters() if p.requires_grad]
@@ -183,8 +154,14 @@ class TestTimeTrainer:
         targets = train_data["target"].to(self.device)
         n_samples = input_rgb.shape[0]
 
-        for step in range(self.ttt_steps):
-            # Sample a mini-batch
+        pbar = tqdm(
+            range(self.ttt_steps),
+            desc="    TTT fine-tune",
+            leave=False,
+            dynamic_ncols=True,
+        )
+
+        for step in pbar:
             indices = torch.randint(0, n_samples, (min(self.ttt_batch_size, n_samples),))
             batch_rgb = input_rgb[indices]
             batch_target = targets[indices]
@@ -195,27 +172,24 @@ class TestTimeTrainer:
             nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
 
+            if step % 20 == 0:
+                pbar.set_postfix(loss=f"{result['loss'].item():.4f}")
+
+        pbar.close()
         self.model.eval()
 
     def _set_ttt_trainable(self) -> None:
         """Freeze everything except last N Sana layers + bridge + decoder."""
-        # Freeze all
         for param in self.model.parameters():
             param.requires_grad = False
 
-        # Unfreeze bridge
         for param in self.model.bridge.parameters():
             param.requires_grad = True
-
-        # Unfreeze decoder
         for param in self.model.decoder.parameters():
             param.requires_grad = True
-
-        # Unfreeze output embedder
         for param in self.model.output_embedder.parameters():
             param.requires_grad = True
 
-        # Unfreeze last N Sana blocks
         n_blocks = len(self.model.sana.blocks)
         start = max(0, n_blocks - self.num_layers_to_update)
         for block in self.model.sana.blocks[start:]:
@@ -230,10 +204,9 @@ class TestTimeTrainer:
         input_grid: List[List[int]],
         num_candidates: int = 32,
     ) -> List[List[List[int]]]:
-        """Generate multiple candidate predictions using diffusion stochasticity."""
+        """Generate multiple candidate predictions."""
         self.model.eval()
 
-        # Prepare input
         input_canvas, _, _, _ = pad_grid_to_canvas(
             input_grid, self.canvas_size, x_offset=1, y_offset=1, mark_boundary=False
         )
@@ -241,11 +214,18 @@ class TestTimeTrainer:
         input_rgb = input_rgb.unsqueeze(0).to(self.device)
 
         candidates = []
-        for _ in range(num_candidates):
+        pbar = tqdm(
+            range(num_candidates),
+            desc="    Generating candidates",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for _ in pbar:
             result = self.model(input_rgb, target=None)
             pred = result["prediction"][0].cpu()
             grid = crop_prediction_from_canvas(pred, x_offset=1, y_offset=1)
             candidates.append(grid)
+        pbar.close()
 
         return candidates
 
@@ -255,7 +235,7 @@ class TestTimeTrainer:
         self,
         candidates: List[List[List[int]]],
     ) -> List[List[List[int]]]:
-        """Score and rank candidates using heuristics. Return sorted list."""
+        """Score and rank candidates using heuristics."""
         scored = []
         for grid in candidates:
             score = self._compute_grid_score(grid)
@@ -263,7 +243,6 @@ class TestTimeTrainer:
 
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        # Deduplicate (prefer unique predictions)
         seen = set()
         unique = []
         for score, grid in scored:
@@ -276,10 +255,7 @@ class TestTimeTrainer:
 
     @staticmethod
     def _compute_grid_score(grid: List[List[int]]) -> float:
-        """Score a predicted grid using heuristic quality metrics.
-
-        Higher score = more likely to be correct.
-        """
+        """Score a predicted grid using heuristic quality metrics."""
         if not grid or not grid[0]:
             return 0.0
 
@@ -287,22 +263,18 @@ class TestTimeTrainer:
         h, w = arr.shape
         score = 0.0
 
-        # 1. Color parsimony: fewer distinct colors is better (weight=0.3)
         n_colors = len(set(arr.flatten()))
         color_score = max(0, 1.0 - (n_colors - 2) / 8.0)
         score += 0.3 * color_score
 
-        # 2. Symmetry: check H/V symmetry (weight=0.3)
         h_sym = np.array_equal(arr, np.fliplr(arr))
         v_sym = np.array_equal(arr, np.flipud(arr))
         sym_score = (int(h_sym) + int(v_sym)) / 2.0
         score += 0.3 * sym_score
 
-        # 3. Non-trivial: penalize all-same grids (weight=0.2)
         if n_colors > 1:
             score += 0.2
 
-        # 4. Reasonable size: penalize tiny or huge grids (weight=0.2)
         if 1 <= h <= 30 and 1 <= w <= 30:
             score += 0.2
 

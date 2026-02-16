@@ -1,22 +1,21 @@
 """ARC-IT: Full integrated model combining all components.
 
 Architecture:
-    Input Grid → [Render RGB 224] → FrozenEncoder → Bridge → conditioning
+    Input Grid → [Render RGB 224] → FrozenEncoder(I-JEPA) → Bridge → conditioning
     Output Grid → [ColorEmbed + PatchEmbed + Noise] → SanaBackbone → SpatialDecoder → logits
 
 Training:
-    1. Encode input grid with frozen encoder → spatial features
+    1. Encode input grid with frozen I-JEPA → spatial features
     2. Bridge maps features to Sana conditioning space
     3. Embed + noise the output grid (diffusion forward process)
-    4. Sana denoises conditioned on encoder features
+    4. Sana denoises conditioned on encoder features (x_0 prediction)
     5. Spatial decoder produces 12-class logits
     6. CrossEntropy loss against ground truth output grid
 
 Inference:
     1. Encode input grid (same as training)
-    2. Start from pure noise
-    3. Iteratively denoise for N steps
-    4. Decode to logits → argmax → discrete grid
+    2. Single-step or multi-step denoising (x_0 prediction)
+    3. Decode to logits → argmax → discrete grid
 """
 
 import math
@@ -35,11 +34,7 @@ from arc_it.models.diffusion import DiffusionScheduler
 
 
 class OutputEmbedder(nn.Module):
-    """Embed the output grid into continuous patch embeddings for diffusion.
-
-    Converts discrete grid → color embeddings → patch embeddings.
-    This is the "input" side of the diffusion process.
-    """
+    """Embed the output grid into continuous patch embeddings for diffusion."""
 
     def __init__(
         self,
@@ -54,34 +49,19 @@ class OutputEmbedder(nn.Module):
         self.grid_size = canvas_size // patch_size
         self.num_patches = self.grid_size ** 2
 
-        # Learned color embeddings (like VARC)
         embed_dim = hidden_size // 4
         self.color_embed = nn.Embedding(num_colors, embed_dim)
-
-        # Patch embedding: groups patch_size x patch_size pixels
         self.patch_proj = nn.Conv2d(
             embed_dim, hidden_size,
             kernel_size=patch_size, stride=patch_size,
         )
-
         nn.init.trunc_normal_(self.color_embed.weight, std=0.02)
 
     def forward(self, grid: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            grid: (B, H, W) integer tensor with values 0-11.
-
-        Returns:
-            (B, num_patches, hidden_size) patch embeddings.
-        """
         B = grid.shape[0]
-        # Color embed: (B, H, W) → (B, H, W, embed_dim)
         x = self.color_embed(grid.long())
-        # Rearrange for conv: (B, embed_dim, H, W)
         x = x.permute(0, 3, 1, 2).contiguous()
-        # Patch projection: (B, hidden_size, grid_size, grid_size)
         x = self.patch_proj(x)
-        # Flatten to sequence: (B, num_patches, hidden_size)
         x = x.flatten(2).transpose(1, 2).contiguous()
         return x
 
@@ -89,14 +69,14 @@ class OutputEmbedder(nn.Module):
 class ARCITModel(nn.Module):
     """Full ARC-IT hybrid model.
 
-    Combines frozen encoder + bridge + Sana diffusion transformer + spatial decoder.
+    Combines frozen I-JEPA encoder + bridge + Sana diffusion transformer + spatial decoder.
     """
 
     def __init__(
         self,
         # Encoder config
         encoder_name: str = "stub",
-        encoder_dim: int = 1024,
+        encoder_dim: int = 1280,
         encoder_pretrained: bool = True,
         # Bridge config
         bridge_hidden: int = 2048,
@@ -108,6 +88,7 @@ class ARCITModel(nn.Module):
         sana_self_attn_head_dim: int = 32,
         sana_cross_attn_heads: int = 16,
         sana_mlp_ratio: float = 2.5,
+        sana_pretrained: bool = False,
         # Decoder config
         canvas_size: int = 64,
         num_colors: int = 12,
@@ -162,6 +143,10 @@ class ARCITModel(nn.Module):
             num_patches=output_num_patches,
         )
 
+        # Load Sana pretrained weights if requested
+        if sana_pretrained:
+            self._load_sana_pretrained()
+
         # ─── Spatial Decoder ─────────────────────────────────────
         self.decoder = SpatialDecoder(
             hidden_size=sana_hidden,
@@ -176,26 +161,24 @@ class ARCITModel(nn.Module):
             num_train_timesteps=num_train_timesteps,
         )
 
+    def _load_sana_pretrained(self) -> None:
+        """Load Sana-0.6B pretrained weights into the backbone."""
+        try:
+            from arc_it.models.sana_pretrained import load_sana_pretrained
+            load_sana_pretrained(self.sana)
+        except Exception as e:
+            print(f"Warning: Could not load Sana pretrained weights: {e}")
+            print("Continuing with random initialization.")
+
     def forward(
         self,
         input_rgb_224: torch.Tensor,
         target: Optional[torch.Tensor] = None,
         difficulty: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Forward pass for training (with target) or inference (without).
-
-        Args:
-            input_rgb_224: (B, 3, 224, 224) normalized RGB for encoder.
-            target: (B, 64, 64) ground truth output grid (integers 0-11).
-                    If None, runs inference mode.
-            difficulty: (B,) difficulty weights for loss. Optional.
-
-        Returns:
-            Dict with "loss" (training) or "logits" and "prediction" (inference).
-        """
-        # ─── Encode input ────────────────────────────────────────
-        encoder_features = self.encoder(input_rgb_224)      # (B, 256, encoder_dim)
-        conditioning = self.bridge(encoder_features)         # (B, 256, sana_hidden)
+        """Forward pass for training (with target) or inference (without)."""
+        encoder_features = self.encoder(input_rgb_224)
+        conditioning = self.bridge(encoder_features)
 
         if target is not None:
             return self._forward_train(conditioning, target, difficulty)
@@ -208,41 +191,30 @@ class ARCITModel(nn.Module):
         target: torch.Tensor,
         difficulty: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Training forward: add noise to output, denoise, compute loss."""
+        """Training forward: add noise to output, denoise (x_0 prediction), compute loss."""
         B = conditioning.shape[0]
         device = conditioning.device
 
-        # Embed the target output grid
-        target_embed = self.output_embedder(target)  # (B, N, C)
-
-        # Sample random timesteps and noise
+        target_embed = self.output_embedder(target)
         timesteps = self.scheduler.sample_timesteps(B, device)
         noise = torch.randn_like(target_embed)
-
-        # Add noise (forward diffusion)
         noisy_embed = self.scheduler.add_noise(target_embed, noise, timesteps)
 
-        # Sana denoises
+        # Model predicts x_0 directly (not epsilon)
         denoised = self.sana(noisy_embed, conditioning, timesteps)
+        logits = self.decoder(denoised)
 
-        # Decode to logits
-        logits = self.decoder(denoised)  # (B, 12, 64, 64)
-
-        # Compute cross-entropy loss
         loss = F.cross_entropy(
             logits,
             target.long(),
             ignore_index=IGNORE_INDEX,
             reduction="none",
-        )  # (B, 64, 64)
+        )
 
-        # Apply difficulty weighting
         if difficulty is not None:
             loss = loss * difficulty[:, None, None]
-
         loss = loss.mean()
 
-        # Compute pixel accuracy (for logging)
         with torch.no_grad():
             pred = logits.argmax(dim=1)
             valid_mask = target != IGNORE_INDEX
@@ -261,7 +233,44 @@ class ARCITModel(nn.Module):
         self,
         conditioning: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Inference forward: denoise from pure noise."""
+        """Inference forward: single-step x_0 prediction from noise.
+
+        Uses single-step prediction at t=T-1 which is fast and effective.
+        The model relies on conditioning from the encoder to produce the output.
+        """
+        B = conditioning.shape[0]
+        N = self.output_embedder.num_patches
+        C = self.sana_hidden
+
+        def denoise_fn(x_t, cond, t):
+            return self.sana(x_t, cond, t)
+
+        # Single-step prediction (fast, effective for trained models)
+        denoised = self.scheduler.single_step_predict(
+            denoise_fn=denoise_fn,
+            shape=(B, N, C),
+            conditioning=conditioning,
+            device=conditioning.device,
+        )
+
+        logits = self.decoder(denoised)
+        prediction = logits.argmax(dim=1)
+
+        return {
+            "logits": logits,
+            "prediction": prediction,
+        }
+
+    @torch.no_grad()
+    def inference_multistep(
+        self,
+        input_rgb_224: torch.Tensor,
+        num_steps: int = 50,
+    ) -> Dict[str, torch.Tensor]:
+        """Multi-step DDPM inference with x_0 prediction (slower, potentially better)."""
+        encoder_features = self.encoder(input_rgb_224)
+        conditioning = self.bridge(encoder_features)
+
         B = conditioning.shape[0]
         N = self.output_embedder.num_patches
         C = self.sana_hidden
@@ -273,17 +282,13 @@ class ARCITModel(nn.Module):
             denoise_fn=denoise_fn,
             shape=(B, N, C),
             conditioning=conditioning,
-            num_inference_steps=self.num_inference_steps,
+            num_inference_steps=num_steps,
             device=conditioning.device,
         )
 
-        logits = self.decoder(denoised)  # (B, 12, 64, 64)
-        prediction = logits.argmax(dim=1)  # (B, 64, 64)
-
-        return {
-            "logits": logits,
-            "prediction": prediction,
-        }
+        logits = self.decoder(denoised)
+        prediction = logits.argmax(dim=1)
+        return {"logits": logits, "prediction": prediction}
 
     @classmethod
     def from_config(cls, config: dict) -> "ARCITModel":
@@ -308,6 +313,7 @@ class ARCITModel(nn.Module):
             sana_self_attn_head_dim=sana.get("linear_head_dim", 32),
             sana_cross_attn_heads=sana["num_heads"],
             sana_mlp_ratio=sana["mlp_ratio"],
+            sana_pretrained=sana.get("pretrained", False),
             canvas_size=data["canvas_size"],
             num_colors=data["num_colors"],
             decoder_channels=tuple(dec["hidden_channels"]),
@@ -317,11 +323,7 @@ class ARCITModel(nn.Module):
 
     def get_trainable_params(self) -> list:
         """Return only trainable parameters (excludes frozen encoder)."""
-        params = []
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                params.append(param)
-        return params
+        return [p for name, p in self.named_parameters() if p.requires_grad]
 
     def param_count(self) -> Dict[str, int]:
         """Count parameters per component."""

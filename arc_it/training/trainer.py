@@ -5,9 +5,10 @@ Stage 2 (Full Training):    Freeze encoder only, train Bridge + Sana + Decoder.
 Stage 3 (Hard Focus):       Same as Stage 2 but lower LR, oversample AGI-2.
 
 Features:
+    - tqdm progress bars for training and validation
     - Automatic mixed precision (AMP) on CUDA, disabled on CPU/MPS
     - Gradient clipping, gradient checkpointing (CUDA only)
-    - Checkpoint saving (best + periodic)
+    - Checkpoint saving (configurable frequency)
     - Weights & Biases logging (optional)
     - Device-adaptive batch sizes and dtypes
 """
@@ -19,6 +20,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from arc_it.models.arc_it_model import ARCITModel
 from arc_it.training.loss import compute_loss
@@ -51,17 +53,15 @@ class Trainer:
         self.use_wandb = use_wandb
         self.wandb_run = None
 
-        # AMP scaler for CUDA
         self.scaler = torch.amp.GradScaler(enabled=self.amp_enabled)
 
-        # Tracking
         self.global_step = 0
         self.best_val_acc = 0.0
 
         train_cfg = self.config.get("training", {})
         self.gradient_clip = train_cfg.get("gradient_clip", 1.0)
         self.log_every = train_cfg.get("log_every_n_steps", 100)
-        self.save_every = train_cfg.get("save_every_n_epochs", 1)
+        self.save_every = train_cfg.get("save_every_n_epochs", 5)
 
     # ─── Public API ──────────────────────────────────────────────
 
@@ -127,11 +127,9 @@ class Trainer:
 
     def _set_frozen_stage(self, freeze_sana: bool) -> None:
         """Configure which parameters are trainable."""
-        # Encoder is always frozen (handled by FrozenEncoder)
         for param in self.model.sana.parameters():
             param.requires_grad = not freeze_sana
 
-        # Bridge, output_embedder, decoder always trainable
         for module in [self.model.bridge, self.model.output_embedder, self.model.decoder]:
             for param in module.parameters():
                 param.requires_grad = True
@@ -143,11 +141,7 @@ class Trainer:
 
     # ─── Optimizer ───────────────────────────────────────────────
 
-    def _build_optimizer(
-        self,
-        lr: float,
-        epochs: int,
-    ) -> tuple:
+    def _build_optimizer(self, lr: float, epochs: int) -> tuple:
         """Build AdamW optimizer and cosine scheduler."""
         opt_cfg = self.config.get("training", {}).get("optimizer", {})
         sched_cfg = self.config.get("training", {}).get("scheduler", {})
@@ -182,20 +176,32 @@ class Trainer:
         epochs: int,
         stage_name: str,
     ) -> None:
-        """Run training for a given number of epochs."""
+        """Run training for a given number of epochs with progress bars."""
         for epoch in range(epochs):
             self.model.train()
             epoch_loss = 0.0
             epoch_acc = 0.0
             epoch_steps = 0
-            t_start = time.time()
 
-            for batch in self.train_loader:
+            pbar = tqdm(
+                self.train_loader,
+                desc=f"  {stage_name} epoch {epoch+1}/{epochs}",
+                leave=True,
+                dynamic_ncols=True,
+            )
+
+            for batch in pbar:
                 metrics = self._train_step(batch, optimizer, scheduler)
                 epoch_loss += metrics["loss"]
                 epoch_acc += metrics["pixel_accuracy"]
                 epoch_steps += 1
                 self.global_step += 1
+
+                pbar.set_postfix(
+                    loss=f"{metrics['loss']:.4f}",
+                    acc=f"{metrics['pixel_accuracy']:.3f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                )
 
                 if self.global_step % self.log_every == 0:
                     self._log({
@@ -205,15 +211,14 @@ class Trainer:
                         "global_step": self.global_step,
                     })
 
-            # Epoch summary
+            pbar.close()
+
             avg_loss = epoch_loss / max(epoch_steps, 1)
             avg_acc = epoch_acc / max(epoch_steps, 1)
-            elapsed = time.time() - t_start
             print(
                 f"  Epoch {epoch + 1}/{epochs} | "
                 f"loss={avg_loss:.4f} | "
-                f"pixel_acc={avg_acc:.3f} | "
-                f"time={elapsed:.1f}s"
+                f"pixel_acc={avg_acc:.3f}"
             )
 
             # Validation
@@ -230,8 +235,8 @@ class Trainer:
                     self.best_val_acc = val_metrics["pixel_accuracy"]
                     self._save_checkpoint(f"best_{stage_name}.pt")
 
-            # Periodic save
-            if (epoch + 1) % self.save_every == 0:
+            # Periodic save (less frequent)
+            if (epoch + 1) % self.save_every == 0 or (epoch + 1) == epochs:
                 self._save_checkpoint(f"{stage_name}_epoch{epoch + 1}.pt")
 
     def _train_step(
@@ -254,7 +259,6 @@ class Trainer:
 
         self.scaler.scale(loss).backward()
 
-        # Gradient clipping
         if self.gradient_clip > 0:
             self.scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(
@@ -274,14 +278,21 @@ class Trainer:
 
     @torch.no_grad()
     def _validate(self) -> Dict[str, float]:
-        """Run validation and return averaged metrics."""
+        """Run validation with progress bar."""
         self.model.eval()
         total_loss = 0.0
         total_pixel_acc = 0.0
         total_grid_match = 0.0
         n_batches = 0
 
-        for batch in self.val_loader:
+        pbar = tqdm(
+            self.val_loader,
+            desc="    Validating",
+            leave=False,
+            dynamic_ncols=True,
+        )
+
+        for batch in pbar:
             input_rgb = batch["input_rgb_224"].to(self.device)
             target = batch["target"].to(self.device)
 
@@ -292,6 +303,12 @@ class Trainer:
             total_pixel_acc += metrics["pixel_accuracy"].item()
             total_grid_match += metrics["grid_exact_match"].item()
             n_batches += 1
+
+            pbar.set_postfix(
+                val_acc=f"{total_pixel_acc / n_batches:.3f}",
+            )
+
+        pbar.close()
 
         n = max(n_batches, 1)
         return {

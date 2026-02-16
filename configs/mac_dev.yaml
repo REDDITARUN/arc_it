@@ -1,15 +1,18 @@
 # ARC-IT Mac Development Override
 # Small batch sizes, CPU/MPS, fast iteration
 
+data:
+  repeat_factor: 1               # No repeat for dev
+
 training:
   batch_size: 4
   num_workers: 0
   epochs: 3
   gradient_checkpointing: false
+  save_every_n_epochs: 1
 
   stage1:
     epochs: 1
-    batch_size_override: 8
 
   stage2:
     epochs: 2
@@ -18,8 +21,11 @@ training:
     epochs: 1
 
 model:
+  encoder:
+    name: "stub"                 # Use stub encoder for fast local dev
+    embed_dim: 1280
   sana:
-    pretrained_path: null        # Skip loading large checkpoint for dev
+    pretrained: false             # Skip loading large checkpoint for dev
 
 ttt:
   steps: 10
