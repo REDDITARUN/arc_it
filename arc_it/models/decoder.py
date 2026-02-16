@@ -95,7 +95,7 @@ class SpatialDecoder(nn.Module):
         B, N, C = patches.shape
         # Reshape to spatial grid
         x = patches.reshape(B, self.grid_size, self.grid_size, C)
-        x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+        x = x.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
 
         # Upsample through transposed convolutions
         x = self.upsample(x)

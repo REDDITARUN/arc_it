@@ -78,11 +78,11 @@ class OutputEmbedder(nn.Module):
         # Color embed: (B, H, W) → (B, H, W, embed_dim)
         x = self.color_embed(grid.long())
         # Rearrange for conv: (B, embed_dim, H, W)
-        x = x.permute(0, 3, 1, 2)
+        x = x.permute(0, 3, 1, 2).contiguous()
         # Patch projection: (B, hidden_size, grid_size, grid_size)
         x = self.patch_proj(x)
         # Flatten to sequence: (B, num_patches, hidden_size)
-        x = x.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2).contiguous()
         return x
 
 

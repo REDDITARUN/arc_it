@@ -120,6 +120,37 @@ cd ..
 python -m pytest tests/ -v
 ```
 
+### End-to-End Demo
+
+Runs the full pipeline (data loading, model build, training steps, inference, TTT) on Mac/CPU:
+
+```bash
+python scripts/demo.py
+```
+
+### Train (H100)
+
+```bash
+# Full 3-stage training (Bridge Alignment → Full Training → Hard Focus)
+python scripts/train.py
+
+# With W&B logging
+python scripts/train.py --wandb
+
+# Resume from checkpoint
+python scripts/train.py --checkpoint checkpoints/best_stage2.pt
+```
+
+### Evaluate
+
+```bash
+# Standard evaluation
+python scripts/evaluate.py --checkpoint checkpoints/best_stage2.pt
+
+# With test-time training (per-task fine-tuning)
+python scripts/evaluate.py --checkpoint checkpoints/best_stage2.pt --ttt
+```
+
 ### Load datasets and inspect
 
 ```python
@@ -152,6 +183,26 @@ print(device_info())
 
 - **Mac (local)**: Develop, test, iterate. Small batches, CPU/MPS. Config auto-adapts.
 - **H100 (remote)**: `git clone` → `pip install` → run training scripts. Full batch sizes, bf16, multi-GPU.
+
+## Training Strategy
+
+**3-Stage Training (H100 Blitz)**:
+
+| Stage | Duration | What | LR |
+|-------|----------|------|----|
+| 1. Bridge Alignment | ~45 min | Freeze Sana, train Bridge + Decoder only | 1e-4 |
+| 2. Full Training | ~2.5 hrs | Unfreeze Sana, train on full augmented dataset | 5e-5 |
+| 3. Hard Focus | ~1 hr | Lower LR, oversample AGI-2 tasks | 1e-5 |
+
+## Test-Time Training (TTT)
+
+For each evaluation task:
+1. Snapshot model weights
+2. Augment the 3-5 demonstration examples (geometric + color perms)
+3. Fine-tune last N Sana layers for K steps on augmented demos
+4. Generate multiple candidate predictions via diffusion stochasticity
+5. Score candidates with heuristics (symmetry, color parsimony)
+6. Restore original weights for next task
 
 ## Data Pipeline
 

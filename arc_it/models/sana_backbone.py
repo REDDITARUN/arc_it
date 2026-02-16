@@ -115,7 +115,7 @@ class LinearAttention(nn.Module):
         denom = (q_p * k_sum).sum(dim=-1, keepdim=True) + 1e-6  # (B, H, N, 1)
         out = out / denom
 
-        out = out.permute(0, 2, 1, 3).reshape(B, N, -1)  # (B, N, inner_dim)
+        out = out.permute(0, 2, 1, 3).contiguous().reshape(B, N, -1)  # (B, N, inner_dim)
         return self.out_proj(out)
 
 
@@ -156,7 +156,7 @@ class CrossAttention(nn.Module):
         B, N, C = x.shape
         M = conditioning.shape[1]
 
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         kv = self.kv_proj(conditioning).reshape(B, M, 2, self.num_heads, self.head_dim)
         k, v = kv.unbind(dim=2)
         k = k.permute(0, 2, 1, 3)
@@ -164,7 +164,7 @@ class CrossAttention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
-        out = (attn @ v).permute(0, 2, 1, 3).reshape(B, N, C)
+        out = (attn @ v).permute(0, 2, 1, 3).contiguous().reshape(B, N, C)
         return self.out_proj(out)
 
 
@@ -209,9 +209,9 @@ class MixFFN(nn.Module):
 
         # Depthwise conv for local 2D patterns
         inner_dim = x.shape[-1]
-        x = x.reshape(B, h, w, inner_dim).permute(0, 3, 1, 2)  # (B, D, H, W)
+        x = x.reshape(B, h, w, inner_dim).permute(0, 3, 1, 2).contiguous()  # (B, D, H, W)
         x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1).reshape(B, N, inner_dim)  # (B, N, D)
+        x = x.permute(0, 2, 3, 1).contiguous().reshape(B, N, inner_dim)  # (B, N, D)
 
         return self.fc2(x)
 
