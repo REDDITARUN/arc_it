@@ -36,6 +36,8 @@ def device_info() -> dict:
     }
     if torch.cuda.is_available():
         info["gpu_name"] = torch.cuda.get_device_name(0)
-        info["gpu_memory_gb"] = round(torch.cuda.get_device_properties(0).total_mem / 1e9, 1)
+        props = torch.cuda.get_device_properties(0)
+        mem = getattr(props, "total_memory", None) or getattr(props, "total_mem", 0)
+        info["gpu_memory_gb"] = round(mem / 1e9, 1)
         info["gpu_count"] = torch.cuda.device_count()
     return info
