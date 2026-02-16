@@ -13,6 +13,9 @@ Usage:
 
     # With W&B logging:
     python scripts/train.py --wandb
+
+    # Push best checkpoint to HF Hub after training:
+    python scripts/train.py --wandb --push-to-hf
 """
 
 import argparse
@@ -21,6 +24,10 @@ from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Load .env before anything else
+from dotenv import load_dotenv
+load_dotenv()
 
 import torch
 from arc_it.utils.config import load_config
@@ -36,6 +43,7 @@ def main():
     parser.add_argument("--override", default=None, help="Override config (e.g., configs/mac_dev.yaml)")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--checkpoint", default=None, help="Resume from checkpoint")
+    parser.add_argument("--push-to-hf", action="store_true", help="Push best checkpoint to HF Hub after training")
     args = parser.parse_args()
 
     # ─── Setup ───────────────────────────────────────────────────
@@ -87,6 +95,22 @@ def main():
 
     # ─── Train ───────────────────────────────────────────────────
     trainer.train()
+
+    # ─── Push to HF Hub ──────────────────────────────────────────
+    if args.push_to_hf:
+        from arc_it.utils.hf_upload import upload_checkpoint_to_hf
+
+        best_ckpt = trainer.checkpoint_dir / f"best_stage3.pt"
+        if not best_ckpt.exists():
+            best_ckpt = trainer.checkpoint_dir / "best_stage2.pt"
+        if not best_ckpt.exists():
+            best_ckpt = trainer.checkpoint_dir / "best_stage1.pt"
+
+        if best_ckpt.exists():
+            url = upload_checkpoint_to_hf(str(best_ckpt))
+            print(f"Model uploaded to: {url}")
+        else:
+            print("No best checkpoint found to upload.")
 
 
 if __name__ == "__main__":

@@ -325,9 +325,11 @@ class Trainer:
 
     def _init_wandb(self) -> None:
         try:
+            import os
             import wandb
             self.wandb_run = wandb.init(
-                project="arc-it",
+                project=os.environ.get("WANDB_PROJECT", "arc-it"),
+                entity=os.environ.get("WANDB_ENTITY") or None,
                 config=self.config,
             )
         except ImportError:
