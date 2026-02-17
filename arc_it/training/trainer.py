@@ -104,11 +104,13 @@ class Trainer:
             stage_name="stage2",
         )
 
-        # Stage 3: Hard Focus
+        # Stage 3: Hard Focus (boost AGI-2 difficulty weight)
         s3 = train_cfg.get("stage3", {})
         print("\n" + "=" * 60)
         print("STAGE 3: Hard Example Focus")
         print("=" * 60)
+        agi2_weight = s3.get("agi2_oversample", 2.0)
+        print(f"  AGI-2 difficulty multiplier: {agi2_weight}x")
         optimizer, scheduler = self._build_optimizer(
             lr=s3.get("lr", 1e-5),
             epochs=s3.get("epochs", 5),
@@ -117,6 +119,7 @@ class Trainer:
             optimizer, scheduler,
             epochs=s3.get("epochs", 5),
             stage_name="stage3",
+            difficulty_multiplier=agi2_weight,
         )
 
         print("\nTraining complete!")
@@ -175,6 +178,7 @@ class Trainer:
         scheduler: torch.optim.lr_scheduler._LRScheduler,
         epochs: int,
         stage_name: str,
+        difficulty_multiplier: float = 1.0,
     ) -> None:
         """Run training for a given number of epochs with progress bars."""
         for epoch in range(epochs):
@@ -191,7 +195,7 @@ class Trainer:
             )
 
             for batch in pbar:
-                metrics = self._train_step(batch, optimizer, scheduler)
+                metrics = self._train_step(batch, optimizer, scheduler, difficulty_multiplier)
                 epoch_loss += metrics["loss"]
                 epoch_acc += metrics["pixel_accuracy"]
                 epoch_steps += 1
@@ -244,12 +248,18 @@ class Trainer:
         batch: Dict[str, Any],
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler._LRScheduler,
+        difficulty_multiplier: float = 1.0,
     ) -> Dict[str, float]:
         """Single training step with AMP and gradient clipping."""
         input_rgb = batch["input_rgb_224"].to(self.device)
         input_canvas = batch["input_canvas"].to(self.device)
         target = batch["target"].to(self.device)
         difficulty = batch["difficulty"].to(self.device)
+
+        # In Stage 3, boost difficulty for hard examples (AGI-2 already has
+        # difficulty=1.5 from the dataset; multiplier amplifies that further)
+        if difficulty_multiplier != 1.0:
+            difficulty = difficulty * difficulty_multiplier
 
         optimizer.zero_grad()
 

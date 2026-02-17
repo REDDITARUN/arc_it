@@ -102,8 +102,7 @@ ttt:
   lr: 1.0e-4
   batch_size: 8                  # Mac: 2
   num_layers_to_update: 4        # Last N Sana layers
-  num_candidates: 32             # Multi-sample generation
-  num_denoising_steps: 50        # Per candidate
+  num_candidates: 32             # Augmentation-based candidate generation
 
 # ─── Evaluation ─────────────────────────────────────────────────────
 evaluation:
