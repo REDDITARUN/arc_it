@@ -19,32 +19,31 @@ MODEL_CARD_TEMPLATE = """---
 tags:
   - arc-agi
   - abstract-reasoning
-  - jepa
-  - sana
-  - vision-transformer
+  - rule-conditioned-transformer
+  - discrete-reasoning
 license: mit
 ---
 
-# ARC-IT: JEPA + Sana Hybrid for ARC-AGI
+# ARC-IT: Rule-Conditioned Transformer for ARC-AGI
 
-A hybrid neural architecture that solves abstract reasoning tasks (ARC-AGI) by combining:
+A novel architecture that solves abstract reasoning tasks (ARC-AGI) by explicitly
+extracting transformation rules from demonstration pairs and applying them to new inputs:
 
-- **JEPA/DINOv2 Encoder (Frozen)** -- Pretrained spatial feature extractor
-- **Bridge Module (Trainable)** -- Maps encoder features to transformer space
-- **Sana Transformer (Trainable)** -- Linear-attention conditional transformer
-- **Spatial Decoder (Trainable)** -- Converts transformer output to discrete ARC grids
+- **GridTokenizer** -- Embeds discrete ARC grids (0-11) into continuous patch tokens
+- **RuleEncoder** -- Extracts transformation rules from demo input/output pairs via cross-attention
+- **RuleApplier** -- Applies the learned rules to a test input via cross-attention
+- **SpatialDecoder** -- Converts output tokens to 64x64 grid logits
 
 ## Architecture
 
 ```
-Input Grid -> Pad to 64x64 Canvas -> Render RGB -> Upsample to 224x224
-  -> DINOv2-L/14 Encoder (FROZEN) -> Bridge -> Sana Transformer (denoising)
-  -> Spatial Decoder -> 12-class logits -> argmax -> Predicted Grid
+Demo Pairs -> GridTokenizer -> RuleEncoder (cross-attention + aggregation) -> Rule Tokens
+Test Input  -> GridTokenizer -> RuleApplier (cross-attention to rules) -> SpatialDecoder -> Predicted Grid
 ```
 
 ## Training
 
-- **3-stage training**: Bridge Alignment -> Full Training -> Hard Focus
+- **2-stage training**: Full Training -> Hard Focus (AGI-2 oversampling)
 - **Test-Time Training (TTT)**: Per-task fine-tuning on demonstration examples
 
 ## Model Details
@@ -179,10 +178,12 @@ def _format_model_details(
 
     model_cfg = config.get("model", {})
     if model_cfg:
-        enc = model_cfg.get("encoder", {})
-        sana = model_cfg.get("sana", {})
-        lines.append(f"- **Encoder**: {enc.get('name', 'unknown')} (dim={enc.get('embed_dim', '?')})")
-        lines.append(f"- **Sana backbone**: hidden={sana.get('hidden_size', '?')}, depth={sana.get('depth', '?')}")
+        hidden = model_cfg.get("hidden_size", "?")
+        re_cfg = model_cfg.get("rule_encoder", {})
+        ra_cfg = model_cfg.get("rule_applier", {})
+        lines.append(f"- **Hidden size**: {hidden}")
+        lines.append(f"- **Rule Encoder**: {re_cfg.get('pair_layers', '?')} pair layers, {re_cfg.get('agg_layers', '?')} agg layers, {re_cfg.get('num_rule_tokens', '?')} rule tokens")
+        lines.append(f"- **Rule Applier**: {ra_cfg.get('num_layers', '?')} layers, {ra_cfg.get('num_heads', '?')} heads")
         lines.append(f"- **Canvas size**: {config.get('data', {}).get('canvas_size', 64)}")
 
     return "\n".join(lines)

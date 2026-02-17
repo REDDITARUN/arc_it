@@ -1,13 +1,20 @@
-"""PyTorch Dataset for ARC-AGI tasks with on-the-fly augmentation.
+"""PyTorch Dataset for ARC-AGI tasks — task-level sampling.
 
-Supports both ARC-AGI-1 and ARC-AGI-2 datasets with:
-- On-the-fly geometric + color augmentation
-- Resolution scaling augmentation
-- Translation augmentation within a fixed canvas
-- Difficulty-weighted sampling (AGI-2 gets higher weight)
+The Rule-Conditioned Transformer processes FULL TASKS, not individual
+examples. Each sample contains:
+    - K demonstration pairs (input, output)
+    - 1 query pair (input, target)
 
-Each sample returns both the canvas representation (for Sana/decoder)
-and the 224x224 RGB rendering (for JEPA/DINOv2 encoder).
+Training mode (subset="train"):
+    Leave-one-out: hold out each training example as the query, use the
+    rest as demos. A task with T training examples yields T samples.
+
+Evaluation mode (subset="test"):
+    Use ALL training examples as demos, predict each test example.
+
+Augmentation is applied CONSISTENTLY across all grids in a task
+(same geometric transform, same color permutation) to preserve
+the underlying transformation rule.
 """
 
 import json
@@ -30,19 +37,13 @@ from arc_it.data.canvas import (
     random_scale_factor,
     resolution_scale,
 )
-from arc_it.data.rendering import render_canvas_to_rgb_224
 
 
-class ARCDataset(Dataset):
-    """Dataset for ARC-AGI training and evaluation.
+class ARCTaskDataset(Dataset):
+    """Task-level dataset for the Rule-Conditioned Transformer.
 
-    Each sample is a single (input_grid, output_grid) pair from a task.
-    Augmentations are applied on-the-fly per __getitem__ call.
-
-    The `repeat_factor` multiplies the effective dataset size. Since
-    augmentation is random on each access, every repeated sample gets
-    a different geometric/color augmentation, effectively expanding
-    the dataset.
+    Each sample is a full task context: K demo pairs + 1 query pair.
+    Augmentations are applied on-the-fly, consistently across all grids.
     """
 
     def __init__(
@@ -51,6 +52,7 @@ class ARCDataset(Dataset):
         split: str = "training",
         subset: str = "train",
         canvas_size: int = 64,
+        max_demos: int = 5,
         enable_augmentation: bool = True,
         enable_translation: bool = True,
         enable_resolution: bool = True,
@@ -62,34 +64,34 @@ class ARCDataset(Dataset):
     ) -> None:
         """
         Args:
-            data_roots: List of paths to ARC dataset roots (e.g.,
-                        ["References/ARC-AGI", "References/ARC-AGI-2"]).
-            split: Dataset split directory name ("training" or "evaluation").
-            subset: Which examples to use ("train" = demonstration pairs,
-                    "test" = test pairs for evaluation).
-            canvas_size: Fixed canvas size for padding.
+            data_roots: Paths to ARC dataset roots.
+            split: "training" or "evaluation".
+            subset: "train" (leave-one-out) or "test" (full demos → test).
+            canvas_size: Fixed canvas dimension.
+            max_demos: Maximum demo pairs (pads shorter, truncates longer).
             enable_augmentation: Enable geometric + color augmentation.
-            enable_translation: Enable random translation in canvas.
+            enable_translation: Enable random canvas offset.
             enable_resolution: Enable random resolution scaling.
-            num_color_perms: Number of color permutations per sample.
+            num_color_perms: Number of color permutation variants.
             keep_background: Keep color 0 fixed during permutation.
-            difficulty_labels: Optional dict mapping source path patterns
-                              to difficulty weights.
-            seed: Random seed for reproducibility.
+            difficulty_labels: Optional difficulty weight overrides.
+            seed: Random seed.
+            repeat_factor: Multiply effective dataset size.
         """
         super().__init__()
         self.canvas_size = canvas_size
+        self.max_demos = max_demos
+        self.subset = subset
         self.enable_augmentation = enable_augmentation
         self.enable_translation = enable_translation
         self.enable_resolution = enable_resolution
-        self.num_color_perms = num_color_perms
         self.keep_background = keep_background
         self.rng = np.random.RandomState(seed)
 
-        self.samples: List[Dict[str, Any]] = []
-        self.task_lookup: Dict[str, int] = {}
+        # Load all tasks
+        self.tasks: List[Dict[str, Any]] = []
+        self.samples: List[Tuple[int, int, str]] = []
 
-        # Load tasks from all data roots
         for root_path in data_roots:
             root = Path(root_path)
             split_dir = root / "data" / split
@@ -97,7 +99,6 @@ class ARCDataset(Dataset):
                 print(f"Warning: {split_dir} does not exist, skipping.")
                 continue
 
-            # Determine difficulty (AGI-2 = 1.5, AGI-1 = 1.0)
             difficulty = 1.0
             if difficulty_labels:
                 for pattern, weight in difficulty_labels.items():
@@ -108,39 +109,49 @@ class ARCDataset(Dataset):
                 difficulty = 1.5
 
             files = sorted(split_dir.glob("*.json"))
-            examples_key = "train" if subset == "train" else "test"
-
             for file_path in files:
-                task_name = file_path.stem
-                if task_name not in self.task_lookup:
-                    self.task_lookup[task_name] = len(self.task_lookup)
-                task_index = self.task_lookup[task_name]
-
                 with file_path.open("r") as fh:
                     task_data = json.load(fh)
 
-                examples = task_data.get(examples_key, [])
-                for ex_idx, example in enumerate(examples):
-                    h_in = len(example["input"])
-                    w_in = len(example["input"][0]) if h_in > 0 else 0
-                    h_out = len(example.get("output", [])) if "output" in example else 0
-                    w_out = len(example["output"][0]) if h_out > 0 else 0
+                task_name = file_path.stem
+                task_idx = len(self.tasks)
 
-                    max_h = max(h_in, h_out)
-                    max_w = max(w_in, w_out)
+                # Validate grid sizes
+                all_examples = task_data.get("train", []) + task_data.get("test", [])
+                skip = False
+                for ex in all_examples:
+                    h = len(ex.get("input", []))
+                    w = len(ex["input"][0]) if h > 0 else 0
+                    if h > 30 or w > 30:
+                        skip = True
+                        break
+                    if "output" in ex:
+                        ho = len(ex["output"])
+                        wo = len(ex["output"][0]) if ho > 0 else 0
+                        if ho > 30 or wo > 30:
+                            skip = True
+                            break
+                if skip:
+                    continue
 
-                    # Skip grids that exceed max size
-                    if max_h > 30 or max_w > 30:
-                        continue
+                self.tasks.append({
+                    "task": task_data,
+                    "name": task_name,
+                    "difficulty": difficulty,
+                    "source": str(root),
+                })
 
-                    self.samples.append({
-                        "example": example,
-                        "task_index": task_index,
-                        "task_name": task_name,
-                        "example_index": ex_idx,
-                        "difficulty": difficulty,
-                        "source": str(root),
-                    })
+                if subset == "train":
+                    # Leave-one-out: each training example becomes a query
+                    train_examples = task_data.get("train", [])
+                    if len(train_examples) >= 2:
+                        for i in range(len(train_examples)):
+                            self.samples.append((task_idx, i, "loo"))
+                else:
+                    # Evaluation: all training → demos, predict test
+                    test_examples = task_data.get("test", [])
+                    for i in range(len(test_examples)):
+                        self.samples.append((task_idx, i, "test"))
 
         if not self.samples:
             raise RuntimeError(
@@ -148,111 +159,157 @@ class ARCDataset(Dataset):
                 f"in roots: {data_roots}"
             )
 
-        self.num_tasks = len(self.task_lookup)
+        self.num_tasks = len(self.tasks)
         self.repeat_factor = max(1, repeat_factor)
         raw_count = len(self.samples)
         effective = raw_count * self.repeat_factor
-        print(f"Loaded {raw_count} samples from {self.num_tasks} tasks "
-              f"(repeat={self.repeat_factor}x → {effective} effective)")
+        print(
+            f"Loaded {raw_count} samples from {self.num_tasks} tasks "
+            f"(repeat={self.repeat_factor}x → {effective} effective)"
+        )
 
     def __len__(self) -> int:
         return len(self.samples) * self.repeat_factor
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         real_idx = idx % len(self.samples)
-        sample = self.samples[real_idx]
-        example = sample["example"]
-        input_grid = example["input"]
-        output_grid = example.get("output")
+        task_idx, query_idx, mode = self.samples[real_idx]
+        task_info = self.tasks[task_idx]
+        task_data = task_info["task"]
 
-        # ─── On-the-fly augmentation ─────────────────────────────
-        color_perm = None
-        geometric_name = "identity"
+        # ─── Build demo pairs and query ──────────────────────────
+        if mode == "loo":
+            # Leave-one-out: hold out one training example as query
+            all_train = task_data["train"]
+            query_example = all_train[query_idx]
+            demo_examples = [
+                ex for i, ex in enumerate(all_train) if i != query_idx
+            ]
+        else:
+            # Evaluation: all training → demos, predict test
+            demo_examples = task_data["train"]
+            query_example = task_data["test"][query_idx]
 
+        # Deep copy to avoid mutating the original data
+        demos = [
+            {"input": [r[:] for r in ex["input"]],
+             "output": [r[:] for r in ex["output"]]}
+            for ex in demo_examples
+        ]
+        query_in = [r[:] for r in query_example["input"]]
+        query_out = (
+            [r[:] for r in query_example["output"]]
+            if "output" in query_example
+            else None
+        )
+
+        # ─── Consistent task-level augmentation ──────────────────
         if self.enable_augmentation:
-            # Random geometric transform (1 of 8)
             geos = get_geometric_augmentations()
             geo_idx = self.rng.randint(0, len(geos))
-            geometric_name, geo_fn = geos[geo_idx]
-            input_grid = geo_fn(input_grid)
-            if output_grid is not None:
-                output_grid = geo_fn(output_grid)
-
-            # Random color permutation
+            _, geo_fn = geos[geo_idx]
             color_perm = random_color_permutation(self.rng, self.keep_background)
-            input_grid = permute_colors(input_grid, color_perm)
-            if output_grid is not None:
-                output_grid = permute_colors(output_grid, color_perm)
 
-        # ─── Resolution scaling ──────────────────────────────────
-        h_in = len(input_grid)
-        w_in = len(input_grid[0]) if h_in > 0 else 0
-        h_out = len(output_grid) if output_grid else 0
-        w_out = len(output_grid[0]) if h_out > 0 else 0
-        max_h = max(h_in, h_out)
-        max_w = max(w_in, w_out)
+            for d in demos:
+                d["input"] = permute_colors(geo_fn(d["input"]), color_perm)
+                d["output"] = permute_colors(geo_fn(d["output"]), color_perm)
+            query_in = permute_colors(geo_fn(query_in), color_perm)
+            if query_out is not None:
+                query_out = permute_colors(geo_fn(query_out), color_perm)
 
+        # ─── Find max grid dimensions across entire task ─────────
+        all_grids = []
+        for d in demos:
+            all_grids.extend([d["input"], d["output"]])
+        all_grids.append(query_in)
+        if query_out is not None:
+            all_grids.append(query_out)
+
+        max_h = max(len(g) for g in all_grids)
+        max_w = max(max(len(r) for r in g) for g in all_grids)
+
+        # ─── Resolution scaling (same for all grids) ─────────────
         if self.enable_resolution:
             scale = random_scale_factor(max_h, max_w, self.canvas_size, self.rng)
         else:
             scale = 1
 
         if scale > 1:
-            input_grid = resolution_scale(input_grid, scale)
-            if output_grid is not None:
-                output_grid = resolution_scale(output_grid, scale)
+            for d in demos:
+                d["input"] = resolution_scale(d["input"], scale)
+                d["output"] = resolution_scale(d["output"], scale)
+            query_in = resolution_scale(query_in, scale)
+            if query_out is not None:
+                query_out = resolution_scale(query_out, scale)
             max_h *= scale
             max_w *= scale
 
-        # ─── Canvas placement ────────────────────────────────────
+        # ─── Canvas placement (same offset for all grids) ────────
         if self.enable_translation:
             x_off, y_off = random_offset(max_h, max_w, self.canvas_size, self.rng)
         else:
             x_off, y_off = 1, 1
 
-        input_canvas, input_mask, _, _ = pad_grid_to_canvas(
-            input_grid, self.canvas_size, x_off, y_off, mark_boundary=False,
+        # ─── Place demo grids on canvas ──────────────────────────
+        demo_input_canvases = []
+        demo_output_canvases = []
+
+        for d in demos[:self.max_demos]:
+            d_in, _, _, _ = pad_grid_to_canvas(
+                d["input"], self.canvas_size, x_off, y_off, mark_boundary=False
+            )
+            d_out, _, _, _ = pad_grid_to_canvas(
+                d["output"], self.canvas_size, x_off, y_off, mark_boundary=True
+            )
+            demo_input_canvases.append(d_in)
+            demo_output_canvases.append(d_out)
+
+        num_demos = len(demo_input_canvases)
+
+        # Pad to max_demos with IGNORE_INDEX canvases
+        while len(demo_input_canvases) < self.max_demos:
+            demo_input_canvases.append(
+                torch.full((self.canvas_size, self.canvas_size),
+                           IGNORE_INDEX, dtype=torch.long)
+            )
+            demo_output_canvases.append(
+                torch.full((self.canvas_size, self.canvas_size),
+                           IGNORE_INDEX, dtype=torch.long)
+            )
+
+        # ─── Place query grids on canvas ─────────────────────────
+        q_in_canvas, _, _, _ = pad_grid_to_canvas(
+            query_in, self.canvas_size, x_off, y_off, mark_boundary=False
         )
 
-        if output_grid is not None:
-            output_canvas, output_mask, out_h, out_w = pad_grid_to_canvas(
-                output_grid, self.canvas_size, x_off, y_off, mark_boundary=True,
+        if query_out is not None:
+            q_out_canvas, q_mask, q_h, q_w = pad_grid_to_canvas(
+                query_out, self.canvas_size, x_off, y_off, mark_boundary=True
             )
+            q_target = q_out_canvas.clone()
+            q_target[q_mask == 0] = IGNORE_INDEX
         else:
-            output_canvas = torch.full(
-                (self.canvas_size, self.canvas_size), IGNORE_INDEX, dtype=torch.long
+            q_target = torch.full(
+                (self.canvas_size, self.canvas_size),
+                IGNORE_INDEX, dtype=torch.long,
             )
-            output_mask = torch.zeros(
-                (self.canvas_size, self.canvas_size), dtype=torch.long
-            )
-            out_h, out_w = 0, 0
-
-        # Mask non-valid pixels in target (for loss masking)
-        target = output_canvas.clone()
-        target[output_mask == 0] = IGNORE_INDEX
-
-        # ─── RGB rendering for JEPA encoder ──────────────────────
-        input_rgb_224 = render_canvas_to_rgb_224(input_canvas, normalize=True)
+            q_h, q_w = 0, 0
 
         return {
-            "input_canvas": input_canvas,           # (64, 64) integers 0-11
-            "input_rgb_224": input_rgb_224,          # (3, 224, 224) normalized float
-            "input_mask": input_mask,                # (64, 64) binary
-            "target": target,                        # (64, 64) integers 0-11, IGNORE_INDEX for padding
-            "output_mask": output_mask,              # (64, 64) binary
-            "task_id": torch.tensor(sample["task_index"], dtype=torch.long),
-            "task_name": sample["task_name"],
-            "example_index": torch.tensor(sample["example_index"], dtype=torch.long),
-            "difficulty": torch.tensor(sample["difficulty"], dtype=torch.float32),
-            "target_shape": torch.tensor([out_h, out_w], dtype=torch.long),
+            "demo_inputs": torch.stack(demo_input_canvases),    # (K, 64, 64)
+            "demo_outputs": torch.stack(demo_output_canvases),  # (K, 64, 64)
+            "query_input": q_in_canvas,                         # (64, 64)
+            "target": q_target,                                 # (64, 64)
+            "num_demos": torch.tensor(num_demos, dtype=torch.long),
+            "difficulty": torch.tensor(task_info["difficulty"], dtype=torch.float32),
+            "task_name": task_info["name"],
             "offset": torch.tensor([x_off, y_off], dtype=torch.long),
             "scale_factor": torch.tensor(scale, dtype=torch.long),
-            "geometric": geometric_name,
         }
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Custom collation for variable metadata types."""
+    """Custom collation for task-level samples."""
     result = {}
     for key in batch[0]:
         values = [item[key] for item in batch]
@@ -267,11 +324,8 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def build_dataloaders(
     config: Dict[str, Any],
-) -> Tuple[ARCDataset, DataLoader, Optional[ARCDataset], Optional[DataLoader]]:
+) -> Tuple["ARCTaskDataset", DataLoader, Optional["ARCTaskDataset"], Optional[DataLoader]]:
     """Build train and optional eval dataloaders from config.
-
-    Args:
-        config: Full configuration dict (from load_config).
 
     Returns:
         (train_dataset, train_loader, eval_dataset, eval_loader)
@@ -281,15 +335,16 @@ def build_dataloaders(
 
     data_roots = [data_cfg["arc_agi1_path"], data_cfg["arc_agi2_path"]]
     canvas_size = data_cfg["canvas_size"]
+    max_demos = data_cfg.get("max_demos", 5)
     aug_cfg = data_cfg["augmentation"]
-
     repeat_factor = data_cfg.get("repeat_factor", 1)
 
-    train_dataset = ARCDataset(
+    train_dataset = ARCTaskDataset(
         data_roots=data_roots,
         split="training",
         subset="train",
         canvas_size=canvas_size,
+        max_demos=max_demos,
         enable_augmentation=aug_cfg["geometric"],
         enable_translation=aug_cfg["translation"],
         enable_resolution=aug_cfg["resolution_scaling"],
@@ -313,11 +368,12 @@ def build_dataloaders(
 
     eval_cfg = config.get("evaluation", {})
     if eval_cfg:
-        eval_dataset = ARCDataset(
+        eval_dataset = ARCTaskDataset(
             data_roots=data_roots,
             split="training",
             subset="test",
             canvas_size=canvas_size,
+            max_demos=max_demos,
             enable_augmentation=False,
             enable_translation=False,
             enable_resolution=False,

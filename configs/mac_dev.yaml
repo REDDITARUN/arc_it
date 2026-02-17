@@ -7,28 +7,15 @@ data:
 training:
   batch_size: 4
   num_workers: 0
-  epochs: 3
-  gradient_checkpointing: false
   save_every_n_epochs: 1
 
   stage1:
-    epochs: 1
-
-  stage2:
     epochs: 2
 
-  stage3:
+  stage2:
     epochs: 1
-
-model:
-  encoder:
-    name: "stub"                 # Use stub encoder for fast local dev
-    embed_dim: 1024              # Match DINOv2 ViT-L dim
-  sana:
-    pretrained: false             # Skip loading large checkpoint for dev
 
 ttt:
   steps: 10
   batch_size: 2
   num_candidates: 4
-  num_denoising_steps: 10

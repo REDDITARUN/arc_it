@@ -1,11 +1,11 @@
-"""Render ARC grids as RGB images for vision model input.
+"""Render ARC grids as RGB images for visualization and analysis.
 
 This module handles the conversion path:
     ARC grid (integers 0-11) → RGB image (3xHxW float tensor)
 
 Two use cases:
-1. render_grid_to_rgb: Raw grid → RGB numpy array (for visualization)
-2. render_canvas_to_rgb_224: Padded canvas → 224x224 normalized tensor (for DINOv2/JEPA)
+1. render_grid_to_rgb: Canvas tensor → RGB float tensor (for visualization)
+2. render_canvas_to_rgb_224: Padded canvas → 224x224 normalized tensor (for analysis/display)
 
 We use nearest-neighbor interpolation for upsampling to preserve
 the sharp color boundaries that are critical for ARC pattern recognition.
@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 from arc_it.data.canvas import ARC_COLORS_RGB
 
-# ImageNet normalization (required by DINOv2)
+# ImageNet normalization (useful for visualization tools)
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -50,7 +50,7 @@ def render_canvas_to_rgb_224(
     canvas: torch.Tensor,
     normalize: bool = True,
 ) -> torch.Tensor:
-    """Convert a canvas to a 224x224 RGB tensor for DINOv2/JEPA input.
+    """Convert a canvas to a 224x224 RGB tensor for visualization/analysis.
 
     Args:
         canvas: (H, W) integer tensor (e.g., 64x64 canvas with values 0-11).

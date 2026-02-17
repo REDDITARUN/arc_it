@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""ARC-IT Evaluation Script.
+"""ARC-IT Evaluation Script (Rule-Conditioned Transformer).
 
 Usage:
     # Evaluate without TTT:
-    python scripts/evaluate.py --checkpoint checkpoints/best_stage2.pt
+    python scripts/evaluate.py --checkpoint checkpoints/best_stage1.pt
 
     # Evaluate with TTT:
-    python scripts/evaluate.py --checkpoint checkpoints/best_stage2.pt --ttt
+    python scripts/evaluate.py --checkpoint checkpoints/best_stage1.pt --ttt
 
     # Evaluate on specific split:
-    python scripts/evaluate.py --checkpoint checkpoints/best_stage2.pt --split evaluation
+    python scripts/evaluate.py --checkpoint checkpoints/best_stage1.pt --split evaluation
 """
 
 import argparse
@@ -26,7 +26,7 @@ import torch
 from tqdm import tqdm
 from arc_it.utils.config import load_config
 from arc_it.utils.device import device_info
-from arc_it.data.dataset import ARCDataset
+from arc_it.data.dataset import ARCTaskDataset
 from arc_it.models.arc_it_model import ARCITModel
 from arc_it.inference.evaluate import Evaluator
 from arc_it.inference.ttt import TestTimeTrainer
@@ -34,18 +34,17 @@ from arc_it.inference.ttt import TestTimeTrainer
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate ARC-IT model")
-    parser.add_argument("--checkpoint", required=True, help="Model checkpoint path")
+    parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--split", default="evaluation", help="Dataset split to evaluate")
-    parser.add_argument("--ttt", action="store_true", help="Enable test-time training")
-    parser.add_argument("--output", default="outputs/eval_results.json", help="Output path")
+    parser.add_argument("--split", default="evaluation")
+    parser.add_argument("--ttt", action="store_true")
+    parser.add_argument("--output", default="outputs/eval_results.json")
     args = parser.parse_args()
 
     config = load_config(args.config)
     info = device_info()
     print(f"Evaluating on {info['device']}")
 
-    # Load model
     model = ARCITModel.from_config(config)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -61,17 +60,18 @@ def main():
             ttt_steps=ttt_cfg.get("steps", 100),
             ttt_lr=ttt_cfg.get("lr", 1e-4),
             ttt_batch_size=ttt_cfg.get("batch_size", 8),
-            num_layers_to_update=ttt_cfg.get("num_layers_to_update", 4),
             num_candidates=ttt_cfg.get("num_candidates", 32),
             canvas_size=data_cfg.get("canvas_size", 64),
+            max_demos=data_cfg.get("max_demos", 5),
         )
         results = evaluate_with_ttt(ttt, data_roots, args.split)
     else:
-        dataset = ARCDataset(
+        dataset = ARCTaskDataset(
             data_roots=data_roots,
             split=args.split,
             subset="test",
             canvas_size=data_cfg["canvas_size"],
+            max_demos=data_cfg.get("max_demos", 5),
             enable_augmentation=False,
             enable_translation=False,
             enable_resolution=False,
@@ -94,15 +94,13 @@ def main():
 
 
 def evaluate_with_ttt(ttt, data_roots, split):
-    """Evaluate with TTT: load raw tasks and predict each with progress bar."""
-    from pathlib import Path
+    """Evaluate with TTT: load raw tasks and predict each."""
     import time
 
     total_correct = 0
     total_tasks = 0
     t_start = time.time()
 
-    # Collect all task files first for progress bar
     all_task_files = []
     for root in data_roots:
         split_dir = Path(root) / "data" / split
@@ -129,11 +127,7 @@ def evaluate_with_ttt(ttt, data_roots, split):
                     break
 
         acc = total_correct / max(total_tasks, 1)
-        pbar.set_postfix(
-            correct=total_correct,
-            total=total_tasks,
-            acc=f"{acc:.3f}",
-        )
+        pbar.set_postfix(correct=total_correct, total=total_tasks, acc=f"{acc:.3f}")
 
     pbar.close()
 

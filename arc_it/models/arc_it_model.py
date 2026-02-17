@@ -1,23 +1,39 @@
-"""ARC-IT: Full integrated model combining all components.
+"""ARC-IT: Rule-Conditioned Transformer for ARC-AGI.
 
-Architecture (direct prediction, no diffusion):
-    Input Grid → [Render RGB 224] → FrozenEncoder(DINOv2) → Bridge → conditioning
-    Input Grid → [ColorEmbed + PatchEmbed] → SanaBackbone(conditioning) → SpatialDecoder → logits
+A novel architecture that explicitly extracts transformation rules from
+demonstration pairs and applies them to new inputs. This mirrors how
+humans solve ARC: look at what changed across examples, then apply
+that pattern to the test input.
 
-Training:
-    1. Encode input grid with frozen DINOv2 → spatial features
-    2. Bridge maps features to Sana conditioning space
-    3. Embed the INPUT grid as patch tokens
-    4. Sana transforms input tokens conditioned on encoder features
-    5. Spatial decoder produces 12-class logits
-    6. CrossEntropy loss against ground truth output grid
+Architecture:
+    Demo pairs:    (in₁,out₁), (in₂,out₂), ...
+                        ↓
+                  ┌────────────────┐
+                  │ Grid Tokenizer │  ← shared tokenizer for all grids
+                  └───────┬────────┘
+                          ↓
+                  ┌────────────────┐
+                  │  Rule Encoder  │  ← cross-attend output↔input per pair
+                  │   (4 layers)   │    then aggregate across pairs
+                  └───────┬────────┘
+                          │ rule_tokens (what's the transformation?)
+                          ↓
+    Test input → Grid Tokenizer → ┌────────────────┐
+                                  │  Rule Applier   │  ← cross-attend to rule_tokens
+                                  │   (4 layers)    │
+                                  └───────┬─────────┘
+                                          ↓
+                                   Spatial Decoder → output grid logits
 
-Inference:
-    Same as training but without the loss computation.
-    No noise, no denoising -- direct single forward pass.
+Key differences from prior ARC approaches:
+    - VARC/TRM: encode only the test input, learn rules implicitly
+    - LLMs: use text-based in-context learning
+    - This: explicitly extract transformation rules as a first-class
+      operation via paired cross-attention on demo pairs
+
+Total: ~20M trainable parameters (no frozen encoder needed).
 """
 
-import math
 from typing import Dict, Optional
 
 import torch
@@ -25,127 +41,84 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from arc_it.data.canvas import NUM_COLORS, IGNORE_INDEX
-from arc_it.models.encoder import FrozenEncoder
-from arc_it.models.bridge import Bridge
-from arc_it.models.sana_backbone import SanaBackbone
+from arc_it.models.grid_tokenizer import GridTokenizer
+from arc_it.models.rule_encoder import RuleEncoder
+from arc_it.models.rule_applier import RuleApplier
 from arc_it.models.decoder import SpatialDecoder
 
 
-class InputEmbedder(nn.Module):
-    """Embed the input grid into continuous patch embeddings for Sana."""
-
-    def __init__(
-        self,
-        num_colors: int = 12,
-        canvas_size: int = 64,
-        hidden_size: int = 1152,
-        patch_size: int = 4,
-    ) -> None:
-        super().__init__()
-        self.canvas_size = canvas_size
-        self.patch_size = patch_size
-        self.grid_size = canvas_size // patch_size
-        self.num_patches = self.grid_size ** 2
-
-        embed_dim = hidden_size // 4
-        self.color_embed = nn.Embedding(num_colors, embed_dim)
-        self.patch_proj = nn.Conv2d(
-            embed_dim, hidden_size,
-            kernel_size=patch_size, stride=patch_size,
-        )
-        nn.init.trunc_normal_(self.color_embed.weight, std=0.02)
-
-    def forward(self, grid: torch.Tensor) -> torch.Tensor:
-        """Embed a discrete grid into patch tokens.
-
-        Args:
-            grid: (B, H, W) integer grid with values 0-11.
-        Returns:
-            (B, num_patches, hidden_size) patch embeddings.
-        """
-        x = self.color_embed(grid.long())
-        x = x.permute(0, 3, 1, 2).contiguous()
-        x = self.patch_proj(x)
-        x = x.flatten(2).transpose(1, 2).contiguous()
-        return x
-
-
 class ARCITModel(nn.Module):
-    """Full ARC-IT hybrid model (direct prediction, no diffusion).
+    """Rule-Conditioned Transformer for ARC-AGI.
 
-    Combines frozen DINOv2 encoder + bridge + Sana conditional transformer + spatial decoder.
+    All ~20M parameters are trainable. No frozen encoder dependency.
     """
 
     def __init__(
         self,
-        # Encoder config
-        encoder_name: str = "stub",
-        encoder_dim: int = 1024,
-        encoder_pretrained: bool = True,
-        # Bridge config
-        bridge_hidden: int = 2048,
-        bridge_dropout: float = 0.1,
-        # Sana config
-        sana_hidden: int = 1152,
-        sana_depth: int = 28,
-        sana_self_attn_heads: int = 36,
-        sana_self_attn_head_dim: int = 32,
-        sana_cross_attn_heads: int = 16,
-        sana_mlp_ratio: float = 2.5,
-        # Decoder config
-        canvas_size: int = 64,
+        # Grid tokenizer
         num_colors: int = 12,
-        decoder_channels: tuple = (512, 256),
-        # Input embedder
-        input_patch_size: int = 4,
+        canvas_size: int = 64,
+        patch_size: int = 4,
+        hidden_size: int = 384,
+        # Rule encoder
+        rule_encoder_pair_layers: int = 2,
+        rule_encoder_agg_layers: int = 2,
+        rule_encoder_heads: int = 8,
+        num_rule_tokens: int = 64,
+        max_demos: int = 5,
+        # Rule applier
+        rule_applier_layers: int = 4,
+        rule_applier_heads: int = 8,
+        # Decoder
+        decoder_channels: tuple = (192, 96),
+        # General
+        mlp_ratio: float = 2.5,
     ) -> None:
         super().__init__()
-        self.sana_hidden = sana_hidden
+        self.hidden_size = hidden_size
         self.canvas_size = canvas_size
         self.num_colors = num_colors
+        self.max_demos = max_demos
 
-        # ─── Frozen Encoder ──────────────────────────────────────
-        self.encoder = FrozenEncoder(
-            encoder_name=encoder_name,
-            pretrained=encoder_pretrained,
-            embed_dim=encoder_dim,
-        )
-        actual_encoder_dim = self.encoder.embed_dim
-        num_patches = self.encoder.num_patches
+        num_patches = (canvas_size // patch_size) ** 2
 
-        # ─── Bridge ──────────────────────────────────────────────
-        self.bridge = Bridge(
-            encoder_dim=actual_encoder_dim,
-            hidden_dim=bridge_hidden,
-            sana_dim=sana_hidden,
-            num_patches=num_patches,
-            dropout=bridge_dropout,
-        )
-
-        # ─── Input Embedder ──────────────────────────────────────
-        self.input_embedder = InputEmbedder(
+        # ─── Shared Grid Tokenizer ────────────────────────────────
+        # Used for all grids: demo inputs, demo outputs, test input
+        self.tokenizer = GridTokenizer(
             num_colors=num_colors,
             canvas_size=canvas_size,
-            hidden_size=sana_hidden,
-            patch_size=input_patch_size,
-        )
-        input_num_patches = self.input_embedder.num_patches
-
-        # ─── Sana Backbone (direct transformer, no diffusion) ────
-        self.sana = SanaBackbone(
-            hidden_size=sana_hidden,
-            depth=sana_depth,
-            self_attn_heads=sana_self_attn_heads,
-            self_attn_head_dim=sana_self_attn_head_dim,
-            cross_attn_heads=sana_cross_attn_heads,
-            mlp_ratio=sana_mlp_ratio,
-            num_patches=input_num_patches,
+            hidden_size=hidden_size,
+            patch_size=patch_size,
         )
 
-        # ─── Spatial Decoder ─────────────────────────────────────
+        # ─── Rule Encoder ─────────────────────────────────────────
+        # Extracts transformation rule from demo pairs
+        self.rule_encoder = RuleEncoder(
+            hidden_size=hidden_size,
+            num_pair_layers=rule_encoder_pair_layers,
+            num_agg_layers=rule_encoder_agg_layers,
+            num_heads=rule_encoder_heads,
+            num_rule_tokens=num_rule_tokens,
+            max_demos=max_demos,
+            num_patches=num_patches,
+            mlp_ratio=mlp_ratio,
+        )
+
+        # ─── Rule Applier ─────────────────────────────────────────
+        # Applies extracted rule to test input
+        self.rule_applier = RuleApplier(
+            hidden_size=hidden_size,
+            num_layers=rule_applier_layers,
+            num_heads=rule_applier_heads,
+            num_patches=num_patches,
+            mlp_ratio=mlp_ratio,
+        )
+
+        # ─── Spatial Decoder ──────────────────────────────────────
+        # Converts output tokens to 64x64 grid logits (12 classes)
         self.decoder = SpatialDecoder(
-            hidden_size=sana_hidden,
-            num_patches=input_num_patches,
+            hidden_size=hidden_size,
+            num_patches=num_patches,
             canvas_size=canvas_size,
             num_colors=num_colors,
             hidden_channels=decoder_channels,
@@ -153,37 +126,59 @@ class ARCITModel(nn.Module):
 
     def forward(
         self,
-        input_rgb_224: torch.Tensor,
-        input_canvas: torch.Tensor,
+        demo_inputs: torch.Tensor,
+        demo_outputs: torch.Tensor,
+        query_input: torch.Tensor,
+        num_demos: torch.Tensor,
         target: Optional[torch.Tensor] = None,
         difficulty: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Forward pass for training (with target) or inference (without).
+        """Forward pass for training or inference.
 
         Args:
-            input_rgb_224: (B, 3, 224, 224) RGB rendering for DINOv2.
-            input_canvas: (B, 64, 64) discrete input grid on canvas.
-            target: (B, 64, 64) discrete target grid (None for inference).
-            difficulty: (B,) per-sample difficulty weights.
+            demo_inputs:  (B, K, 64, 64) padded demo input canvases.
+            demo_outputs: (B, K, 64, 64) padded demo output canvases.
+            query_input:  (B, 64, 64) test input canvas.
+            num_demos:    (B,) number of valid demos per sample.
+            target:       (B, 64, 64) target output canvas (None for inference).
+            difficulty:   (B,) per-sample difficulty weights (optional).
+
+        Returns:
+            Dict with keys: logits, prediction, and optionally loss + pixel_accuracy.
         """
-        # Encode input with frozen DINOv2
-        encoder_features = self.encoder(input_rgb_224)
-        conditioning = self.bridge(encoder_features)
+        B, K = demo_inputs.shape[:2]
+        CS = self.canvas_size
 
-        # Embed input grid as tokens
-        input_tokens = self.input_embedder(input_canvas)
+        # ── Tokenize all demo grids ──────────────────────────────
+        demo_in_flat = demo_inputs.reshape(B * K, CS, CS)
+        demo_out_flat = demo_outputs.reshape(B * K, CS, CS)
 
-        # Sana transforms input tokens conditioned on encoder features
-        output_tokens = self.sana(input_tokens, conditioning)
+        demo_in_tokens = self.tokenizer(demo_in_flat)       # (B*K, N, C)
+        demo_out_tokens = self.tokenizer(demo_out_flat)      # (B*K, N, C)
 
-        # Decode to logits
-        logits = self.decoder(output_tokens)
+        N = demo_in_tokens.shape[1]
+        C = self.hidden_size
+        demo_in_tokens = demo_in_tokens.reshape(B, K, N, C)
+        demo_out_tokens = demo_out_tokens.reshape(B, K, N, C)
 
-        # Build result
+        # ── Extract rule from demo pairs ─────────────────────────
+        rule_tokens = self.rule_encoder(
+            demo_in_tokens, demo_out_tokens, num_demos
+        )  # (B, M, C)
+
+        # ── Tokenize test input ──────────────────────────────────
+        test_tokens = self.tokenizer(query_input)  # (B, N, C)
+
+        # ── Apply rule to test input ─────────────────────────────
+        output_tokens = self.rule_applier(test_tokens, rule_tokens)  # (B, N, C)
+
+        # ── Decode to grid logits ────────────────────────────────
+        logits = self.decoder(output_tokens)  # (B, 12, 64, 64)
+
+        # ── Build result ─────────────────────────────────────────
         result = {"logits": logits}
 
         if target is not None:
-            # Compute loss
             valid_mask = (target != IGNORE_INDEX)
             ce = F.cross_entropy(
                 logits,
@@ -206,7 +201,6 @@ class ARCITModel(nn.Module):
             result["loss"] = loss
             result["pixel_accuracy"] = pixel_acc
 
-        # Always include prediction
         result["prediction"] = logits.argmax(dim=1)
 
         return result
@@ -215,41 +209,43 @@ class ARCITModel(nn.Module):
     def from_config(cls, config: dict) -> "ARCITModel":
         """Create model from a configuration dictionary."""
         model_cfg = config["model"]
-        enc = model_cfg["encoder"]
-        brg = model_cfg["bridge"]
-        sana = model_cfg["sana"]
-        dec = model_cfg["decoder"]
         data = config["data"]
 
+        tok = model_cfg.get("tokenizer", {})
+        re = model_cfg.get("rule_encoder", {})
+        ra = model_cfg.get("rule_applier", {})
+        dec = model_cfg.get("decoder", {})
+
         return cls(
-            encoder_name=enc["name"],
-            encoder_dim=enc["embed_dim"],
-            encoder_pretrained=enc["pretrained"],
-            bridge_hidden=brg["hidden_dim"],
-            bridge_dropout=brg["dropout"],
-            sana_hidden=sana["hidden_size"],
-            sana_depth=sana["depth"],
-            sana_self_attn_heads=sana["hidden_size"] // sana.get("linear_head_dim", 32),
-            sana_self_attn_head_dim=sana.get("linear_head_dim", 32),
-            sana_cross_attn_heads=sana["num_heads"],
-            sana_mlp_ratio=sana["mlp_ratio"],
-            canvas_size=data["canvas_size"],
-            num_colors=data["num_colors"],
-            decoder_channels=tuple(dec["hidden_channels"]),
+            num_colors=data.get("num_colors", 12),
+            canvas_size=data.get("canvas_size", 64),
+            patch_size=tok.get("patch_size", 4),
+            hidden_size=model_cfg.get("hidden_size", 384),
+            rule_encoder_pair_layers=re.get("pair_layers", 2),
+            rule_encoder_agg_layers=re.get("agg_layers", 2),
+            rule_encoder_heads=re.get("num_heads", 8),
+            num_rule_tokens=re.get("num_rule_tokens", 64),
+            max_demos=data.get("max_demos", 5),
+            rule_applier_layers=ra.get("num_layers", 4),
+            rule_applier_heads=ra.get("num_heads", 8),
+            decoder_channels=tuple(dec.get("hidden_channels", [192, 96])),
+            mlp_ratio=model_cfg.get("mlp_ratio", 2.5),
         )
 
     def get_trainable_params(self) -> list:
-        """Return only trainable parameters (excludes frozen encoder)."""
-        return [p for name, p in self.named_parameters() if p.requires_grad]
+        """Return all trainable parameters (all params are trainable)."""
+        return [p for p in self.parameters() if p.requires_grad]
 
     def param_count(self) -> Dict[str, int]:
         """Count parameters per component."""
         counts = {}
-        for component_name in ["encoder", "bridge", "input_embedder", "sana", "decoder"]:
-            component = getattr(self, component_name)
-            total = sum(p.numel() for p in component.parameters())
-            trainable = sum(p.numel() for p in component.parameters() if p.requires_grad)
-            counts[component_name] = {"total": total, "trainable": trainable}
+        for name in ["tokenizer", "rule_encoder", "rule_applier", "decoder"]:
+            comp = getattr(self, name)
+            total = sum(p.numel() for p in comp.parameters())
+            trainable = sum(
+                p.numel() for p in comp.parameters() if p.requires_grad
+            )
+            counts[name] = {"total": total, "trainable": trainable}
         counts["_total"] = {
             "total": sum(c["total"] for c in counts.values()),
             "trainable": sum(c["trainable"] for c in counts.values()),

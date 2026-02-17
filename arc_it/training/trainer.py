@@ -1,14 +1,15 @@
-"""Three-stage Trainer for ARC-IT.
+"""Two-stage Trainer for ARC-IT Rule-Conditioned Transformer.
 
-Stage 1 (Bridge Alignment): Freeze encoder + Sana, train only Bridge + Decoder.
-Stage 2 (Full Training):    Freeze encoder only, train Bridge + Sana + Decoder.
-Stage 3 (Hard Focus):       Same as Stage 2 but lower LR, oversample AGI-2.
+Stage 1 (Full Training):  Train all components with cosine LR schedule.
+Stage 2 (Hard Focus):     Lower LR, oversample AGI-2 tasks.
+
+All ~20M parameters are trainable from the start (no frozen encoder).
 
 Features:
     - tqdm progress bars for training and validation
-    - Automatic mixed precision (AMP) on CUDA, disabled on CPU/MPS
-    - Gradient clipping, gradient checkpointing (CUDA only)
-    - Checkpoint saving (configurable frequency)
+    - Automatic mixed precision (AMP) on CUDA
+    - Gradient clipping
+    - Checkpoint saving
     - Weights & Biases logging (optional)
     - Device-adaptive batch sizes and dtypes
 """
@@ -28,7 +29,7 @@ from arc_it.utils.device import get_device, get_dtype, get_amp_enabled
 
 
 class Trainer:
-    """Manages the full 3-stage training process."""
+    """Manages the training process for the Rule-Conditioned Transformer."""
 
     def __init__(
         self,
@@ -66,59 +67,43 @@ class Trainer:
     # ─── Public API ──────────────────────────────────────────────
 
     def train(self) -> None:
-        """Run the full 3-stage training pipeline."""
+        """Run the full training pipeline."""
         if self.use_wandb:
             self._init_wandb()
 
         train_cfg = self.config.get("training", {})
 
-        # Stage 1: Bridge Alignment
+        # Stage 1: Full Training
         s1 = train_cfg.get("stage1", {})
         print("\n" + "=" * 60)
-        print("STAGE 1: Bridge Alignment")
+        print("STAGE 1: Full Training")
         print("=" * 60)
-        self._set_frozen_stage(freeze_sana=True)
+        self._print_trainable_info()
         optimizer, scheduler = self._build_optimizer(
             lr=s1.get("lr", 1e-4),
-            epochs=s1.get("epochs", 5),
+            epochs=s1.get("epochs", 50),
         )
         self._train_epochs(
             optimizer, scheduler,
-            epochs=s1.get("epochs", 5),
+            epochs=s1.get("epochs", 50),
             stage_name="stage1",
         )
 
-        # Stage 2: Full Training
+        # Stage 2: Hard Focus (boost AGI-2 difficulty weight)
         s2 = train_cfg.get("stage2", {})
         print("\n" + "=" * 60)
-        print("STAGE 2: Full Training")
+        print("STAGE 2: Hard Example Focus")
         print("=" * 60)
-        self._set_frozen_stage(freeze_sana=False)
-        optimizer, scheduler = self._build_optimizer(
-            lr=s2.get("lr", 5e-5),
-            epochs=s2.get("epochs", 20),
-        )
-        self._train_epochs(
-            optimizer, scheduler,
-            epochs=s2.get("epochs", 20),
-            stage_name="stage2",
-        )
-
-        # Stage 3: Hard Focus (boost AGI-2 difficulty weight)
-        s3 = train_cfg.get("stage3", {})
-        print("\n" + "=" * 60)
-        print("STAGE 3: Hard Example Focus")
-        print("=" * 60)
-        agi2_weight = s3.get("agi2_oversample", 2.0)
+        agi2_weight = s2.get("agi2_oversample", 2.0)
         print(f"  AGI-2 difficulty multiplier: {agi2_weight}x")
         optimizer, scheduler = self._build_optimizer(
-            lr=s3.get("lr", 1e-5),
-            epochs=s3.get("epochs", 5),
+            lr=s2.get("lr", 1e-5),
+            epochs=s2.get("epochs", 10),
         )
         self._train_epochs(
             optimizer, scheduler,
-            epochs=s3.get("epochs", 5),
-            stage_name="stage3",
+            epochs=s2.get("epochs", 10),
+            stage_name="stage2",
             difficulty_multiplier=agi2_weight,
         )
 
@@ -126,21 +111,13 @@ class Trainer:
         if self.wandb_run:
             self.wandb_run.finish()
 
-    # ─── Stage Freezing ──────────────────────────────────────────
+    # ─── Info ────────────────────────────────────────────────────
 
-    def _set_frozen_stage(self, freeze_sana: bool) -> None:
-        """Configure which parameters are trainable."""
-        for param in self.model.sana.parameters():
-            param.requires_grad = not freeze_sana
-
-        for module in [self.model.bridge, self.model.input_embedder, self.model.decoder]:
-            for param in module.parameters():
-                param.requires_grad = True
-
+    def _print_trainable_info(self) -> None:
+        """Print trainable parameter counts."""
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
         print(f"  Trainable: {trainable / 1e6:.1f}M / {total / 1e6:.1f}M params")
-        print(f"  Sana frozen: {freeze_sana}")
 
     # ─── Optimizer ───────────────────────────────────────────────
 
@@ -180,7 +157,7 @@ class Trainer:
         stage_name: str,
         difficulty_multiplier: float = 1.0,
     ) -> None:
-        """Run training for a given number of epochs with progress bars."""
+        """Run training for a given number of epochs."""
         for epoch in range(epochs):
             self.model.train()
             epoch_loss = 0.0
@@ -195,7 +172,9 @@ class Trainer:
             )
 
             for batch in pbar:
-                metrics = self._train_step(batch, optimizer, scheduler, difficulty_multiplier)
+                metrics = self._train_step(
+                    batch, optimizer, scheduler, difficulty_multiplier
+                )
                 epoch_loss += metrics["loss"]
                 epoch_acc += metrics["pixel_accuracy"]
                 epoch_steps += 1
@@ -233,13 +212,15 @@ class Trainer:
                     f"val_pixel_acc={val_metrics['pixel_accuracy']:.3f} | "
                     f"val_grid_match={val_metrics['grid_exact_match']:.3f}"
                 )
-                self._log({f"{stage_name}/val_{k}": v for k, v in val_metrics.items()})
+                self._log({
+                    f"{stage_name}/val_{k}": v for k, v in val_metrics.items()
+                })
 
                 if val_metrics["pixel_accuracy"] > self.best_val_acc:
                     self.best_val_acc = val_metrics["pixel_accuracy"]
                     self._save_checkpoint(f"best_{stage_name}.pt")
 
-            # Periodic save (less frequent)
+            # Periodic save
             if (epoch + 1) % self.save_every == 0 or (epoch + 1) == epochs:
                 self._save_checkpoint(f"{stage_name}_epoch{epoch + 1}.pt")
 
@@ -251,30 +232,33 @@ class Trainer:
         difficulty_multiplier: float = 1.0,
     ) -> Dict[str, float]:
         """Single training step with AMP and gradient clipping."""
-        input_rgb = batch["input_rgb_224"].to(self.device)
-        input_canvas = batch["input_canvas"].to(self.device)
+        demo_inputs = batch["demo_inputs"].to(self.device)
+        demo_outputs = batch["demo_outputs"].to(self.device)
+        query_input = batch["query_input"].to(self.device)
+        num_demos = batch["num_demos"].to(self.device)
         target = batch["target"].to(self.device)
         difficulty = batch["difficulty"].to(self.device)
 
-        # In Stage 3, boost difficulty for hard examples (AGI-2 already has
-        # difficulty=1.5 from the dataset; multiplier amplifies that further)
         if difficulty_multiplier != 1.0:
             difficulty = difficulty * difficulty_multiplier
 
         optimizer.zero_grad()
 
         amp_device = "cuda" if self.amp_enabled else "cpu"
-        with torch.amp.autocast(device_type=amp_device, dtype=self.dtype, enabled=self.amp_enabled):
-            result = self.model(input_rgb, input_canvas, target=target, difficulty=difficulty)
+        with torch.amp.autocast(
+            device_type=amp_device, dtype=self.dtype, enabled=self.amp_enabled
+        ):
+            result = self.model(
+                demo_inputs, demo_outputs, query_input, num_demos,
+                target=target, difficulty=difficulty,
+            )
             loss = result["loss"]
 
         self.scaler.scale(loss).backward()
 
         if self.gradient_clip > 0:
             self.scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.gradient_clip
-            )
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
 
         self.scaler.step(optimizer)
         self.scaler.update()
@@ -304,11 +288,15 @@ class Trainer:
         )
 
         for batch in pbar:
-            input_rgb = batch["input_rgb_224"].to(self.device)
-            input_canvas = batch["input_canvas"].to(self.device)
+            demo_inputs = batch["demo_inputs"].to(self.device)
+            demo_outputs = batch["demo_outputs"].to(self.device)
+            query_input = batch["query_input"].to(self.device)
+            num_demos = batch["num_demos"].to(self.device)
             target = batch["target"].to(self.device)
 
-            result = self.model(input_rgb, input_canvas, target=target)
+            result = self.model(
+                demo_inputs, demo_outputs, query_input, num_demos, target=target
+            )
             metrics = compute_loss(result["logits"], target)
 
             total_loss += metrics["loss"].item()
@@ -316,9 +304,7 @@ class Trainer:
             total_grid_match += metrics["grid_exact_match"].item()
             n_batches += 1
 
-            pbar.set_postfix(
-                val_acc=f"{total_pixel_acc / n_batches:.3f}",
-            )
+            pbar.set_postfix(val_acc=f"{total_pixel_acc / n_batches:.3f}")
 
         pbar.close()
 

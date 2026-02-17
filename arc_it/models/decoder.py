@@ -1,10 +1,10 @@
-"""Spatial ARC Decoder: converts Sana patch embeddings to 64x64 grid logits.
+"""Spatial ARC Decoder: converts transformer patch tokens to 64x64 grid logits.
 
 Architecture:
-    Input:  (B, 256, 1152) Sana output patches
-    Reshape to spatial: (B, 1152, 16, 16)
-    TransConv1: (B, 512, 32, 32)
-    TransConv2: (B, 256, 64, 64)
+    Input:  (B, 256, hidden_size) output patch tokens from RuleApplier
+    Reshape to spatial: (B, hidden_size, 16, 16)
+    TransConv1: (B, ch1, 32, 32)
+    TransConv2: (B, ch2, 64, 64)
     Conv1x1:    (B, 12, 64, 64) — 12-class logits per pixel
     Output: (B, 12, 64, 64)
 
@@ -20,7 +20,7 @@ import torch.nn as nn
 
 
 class SpatialDecoder(nn.Module):
-    """Upsample Sana patches to full-resolution 12-class grid logits."""
+    """Upsample transformer patch tokens to full-resolution 12-class grid logits."""
 
     def __init__(
         self,
@@ -32,7 +32,7 @@ class SpatialDecoder(nn.Module):
     ) -> None:
         """
         Args:
-            hidden_size: Sana's output dimension per patch.
+            hidden_size: Transformer's output dimension per patch.
             num_patches: Number of patches (must be perfect square).
             canvas_size: Target spatial resolution.
             num_colors: Number of output classes (10 ARC + IGNORE + PAD).

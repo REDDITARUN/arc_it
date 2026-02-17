@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""ARC-IT Training Script.
+"""ARC-IT Training Script (Rule-Conditioned Transformer).
 
 Usage:
     # Mac (auto-detects, uses small batches):
     python scripts/train.py
 
-    # H100 (auto-detects CUDA, uses full config):
+    # H100/A100 (auto-detects CUDA, uses full config):
     python scripts/train.py
 
     # With custom config:
@@ -22,10 +22,8 @@ import argparse
 import sys
 from pathlib import Path
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Load .env before anything else
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -39,19 +37,18 @@ from arc_it.training.trainer import Trainer
 
 def main():
     parser = argparse.ArgumentParser(description="Train ARC-IT model")
-    parser.add_argument("--config", default="configs/default.yaml", help="Config file path")
-    parser.add_argument("--override", default=None, help="Override config (e.g., configs/mac_dev.yaml)")
-    parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
+    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--override", default=None)
+    parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--checkpoint", default=None, help="Resume from checkpoint")
-    parser.add_argument("--push-to-hf", action="store_true", help="Push best checkpoint to HF Hub after training")
+    parser.add_argument("--push-to-hf", action="store_true")
     args = parser.parse_args()
 
-    # ─── Setup ───────────────────────────────────────────────────
     config = load_config(args.config, args.override)
     info = device_info()
 
     print("=" * 60)
-    print("ARC-IT Training")
+    print("ARC-IT Training (Rule-Conditioned Transformer)")
     print("=" * 60)
     print(f"Device:     {info['device']}")
     if info.get("gpu_name"):
@@ -80,7 +77,7 @@ def main():
             print(f"  {name:20s}: {c['total']/1e6:>8.1f}M total, {c['trainable']/1e6:>8.1f}M trainable")
     print()
 
-    # ─── Resume ──────────────────────────────────────────────────
+    # ─── Trainer ─────────────────────────────────────────────────
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -100,9 +97,7 @@ def main():
     if args.push_to_hf:
         from arc_it.utils.hf_upload import upload_checkpoint_to_hf
 
-        best_ckpt = trainer.checkpoint_dir / f"best_stage3.pt"
-        if not best_ckpt.exists():
-            best_ckpt = trainer.checkpoint_dir / "best_stage2.pt"
+        best_ckpt = trainer.checkpoint_dir / "best_stage2.pt"
         if not best_ckpt.exists():
             best_ckpt = trainer.checkpoint_dir / "best_stage1.pt"
 

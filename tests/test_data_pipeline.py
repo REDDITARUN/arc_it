@@ -52,11 +52,12 @@ def sample_grid():
 
 @pytest.fixture
 def sample_task():
-    """A minimal ARC task with 2 train + 1 test example."""
+    """A minimal ARC task with 3 train + 1 test example."""
     return {
         "train": [
             {"input": [[0, 1], [2, 3]], "output": [[3, 2], [1, 0]]},
             {"input": [[1, 0], [3, 2]], "output": [[2, 3], [0, 1]]},
+            {"input": [[4, 5], [6, 7]], "output": [[7, 6], [5, 4]]},
         ],
         "test": [
             {"input": [[0, 2], [1, 3]], "output": [[3, 1], [2, 0]]},
@@ -93,7 +94,6 @@ class TestCanvas:
         assert h == 3
         assert w == 4
         assert canvas.dtype == torch.long
-        # Grid values should be preserved at offset position
         assert canvas[1, 1].item() == 0
         assert canvas[1, 2].item() == 1
         assert canvas[2, 1].item() == 4
@@ -102,14 +102,11 @@ class TestCanvas:
         canvas, mask, h, w = pad_grid_to_canvas(
             sample_grid, canvas_size=64, mark_boundary=True
         )
-        # Right edge should have PAD_INDEX
-        assert canvas[1, 5].item() == PAD_INDEX  # y_offset=1, x_offset+width=1+4=5
-        # Bottom edge should have PAD_INDEX
-        assert canvas[4, 1].item() == PAD_INDEX  # y_offset+height=1+3=4
+        assert canvas[1, 5].item() == PAD_INDEX
+        assert canvas[4, 1].item() == PAD_INDEX
 
     def test_pad_ignore_fills(self, sample_grid):
         canvas, _, _, _ = pad_grid_to_canvas(sample_grid, canvas_size=64)
-        # Corners should be IGNORE_INDEX
         assert canvas[0, 0].item() == IGNORE_INDEX
         assert canvas[63, 63].item() == IGNORE_INDEX
 
@@ -124,16 +121,13 @@ class TestCanvas:
         assert scaled[0][2] == 1
 
     def test_crop_prediction(self):
-        # Simulate a prediction on a canvas
         canvas = torch.full((64, 64), IGNORE_INDEX, dtype=torch.long)
-        # Place a 3x3 grid at offset (2, 3) with boundary markers
         canvas[3, 2] = 1
         canvas[3, 3] = 2
         canvas[3, 4] = 3
         canvas[4, 2] = 4
         canvas[4, 3] = 5
         canvas[4, 4] = 6
-        # Boundary markers
         canvas[3, 5] = PAD_INDEX
         canvas[4, 5] = PAD_INDEX
         canvas[5, 2] = PAD_INDEX
@@ -150,8 +144,8 @@ class TestCanvas:
 class TestAugmentation:
     def test_rotate_90(self, sample_grid):
         rotated = rotate_grid(sample_grid, k=1)
-        assert len(rotated) == 4  # width becomes height
-        assert len(rotated[0]) == 3  # height becomes width
+        assert len(rotated) == 4
+        assert len(rotated[0]) == 3
 
     def test_rotate_360_is_identity(self, sample_grid):
         rotated = rotate_grid(sample_grid, k=4)
@@ -163,7 +157,7 @@ class TestAugmentation:
 
     def test_flip_vertical(self, sample_grid):
         flipped = flip_grid(sample_grid, axis=0)
-        assert flipped[0] == [8, 9, 0, 1]  # last row becomes first
+        assert flipped[0] == [8, 9, 0, 1]
 
     def test_transpose(self):
         grid = [[1, 2], [3, 4]]
@@ -183,9 +177,9 @@ class TestAugmentation:
         grid = [[0, 1, 2], [3, 4, 5]]
         perm = [0, 5, 4, 3, 2, 1, 6, 7, 8, 9]
         result = permute_colors(grid, perm)
-        assert result[0][1] == 5  # color 1 → 5
-        assert result[0][2] == 4  # color 2 → 4
-        assert result[1][0] == 3  # color 3 → 3
+        assert result[0][1] == 5
+        assert result[0][2] == 4
+        assert result[1][0] == 3
 
     def test_color_perm_inverse(self):
         perm = random_color_permutation(np.random.RandomState(42))
@@ -208,7 +202,7 @@ class TestAugmentation:
 
     def test_generate_all_augmentations(self, sample_task):
         results = generate_all_augmentations(sample_task, num_color_perms=3)
-        assert len(results) == 8 * 3  # 8 geometric × 3 color perms
+        assert len(results) == 8 * 3
         for aug_task, meta in results:
             assert "train" in aug_task
             assert "geometric" in meta
@@ -240,7 +234,7 @@ class TestRendering:
 
     def test_batch_render(self, sample_grid):
         canvas, _, _, _ = pad_grid_to_canvas(sample_grid, canvas_size=64)
-        batch = torch.stack([canvas, canvas, canvas])  # (3, 64, 64)
+        batch = torch.stack([canvas, canvas, canvas])
         rgb_batch = batch_render_canvas_to_rgb_224(batch, normalize=True)
         assert rgb_batch.shape == (3, 3, 224, 224)
 
@@ -249,12 +243,13 @@ class TestRendering:
 
 class TestDatasetIntegration:
     def test_dataset_loads(self, arc_data_dir):
-        from arc_it.data.dataset import ARCDataset
-        ds = ARCDataset(
+        from arc_it.data.dataset import ARCTaskDataset
+        ds = ARCTaskDataset(
             data_roots=[arc_data_dir],
             split="training",
             subset="train",
             canvas_size=64,
+            max_demos=5,
             enable_augmentation=True,
             enable_translation=True,
             enable_resolution=False,
@@ -263,33 +258,34 @@ class TestDatasetIntegration:
         assert ds.num_tasks == 2
 
     def test_dataset_getitem(self, arc_data_dir):
-        from arc_it.data.dataset import ARCDataset
-        ds = ARCDataset(
+        from arc_it.data.dataset import ARCTaskDataset
+        ds = ARCTaskDataset(
             data_roots=[arc_data_dir],
             split="training",
             subset="train",
             canvas_size=64,
+            max_demos=5,
             enable_augmentation=False,
             enable_translation=False,
             enable_resolution=False,
         )
         sample = ds[0]
-        assert sample["input_canvas"].shape == (64, 64)
-        assert sample["input_rgb_224"].shape == (3, 224, 224)
+        assert sample["demo_inputs"].shape == (5, 64, 64)
+        assert sample["demo_outputs"].shape == (5, 64, 64)
+        assert sample["query_input"].shape == (64, 64)
         assert sample["target"].shape == (64, 64)
-        assert sample["input_mask"].shape == (64, 64)
-        assert sample["output_mask"].shape == (64, 64)
-        assert sample["task_id"].dtype == torch.long
+        assert sample["num_demos"].dtype == torch.long
         assert sample["difficulty"].dtype == torch.float32
         assert sample["scale_factor"].item() == 1
 
     def test_dataloader_batching(self, arc_data_dir):
-        from arc_it.data.dataset import ARCDataset, collate_fn
-        ds = ARCDataset(
+        from arc_it.data.dataset import ARCTaskDataset, collate_fn
+        ds = ARCTaskDataset(
             data_roots=[arc_data_dir],
             split="training",
             subset="train",
             canvas_size=64,
+            max_demos=5,
             enable_augmentation=False,
             enable_translation=False,
             enable_resolution=False,
@@ -298,24 +294,25 @@ class TestDatasetIntegration:
             ds, batch_size=2, collate_fn=collate_fn
         )
         batch = next(iter(loader))
-        assert batch["input_canvas"].shape == (2, 64, 64)
-        assert batch["input_rgb_224"].shape == (2, 3, 224, 224)
+        assert batch["demo_inputs"].shape == (2, 5, 64, 64)
+        assert batch["demo_outputs"].shape == (2, 5, 64, 64)
+        assert batch["query_input"].shape == (2, 64, 64)
         assert batch["target"].shape == (2, 64, 64)
         assert batch["difficulty"].shape == (2,)
 
     def test_target_has_ignore_index(self, arc_data_dir):
-        from arc_it.data.dataset import ARCDataset
-        ds = ARCDataset(
+        from arc_it.data.dataset import ARCTaskDataset
+        ds = ARCTaskDataset(
             data_roots=[arc_data_dir],
             split="training",
             subset="train",
             canvas_size=64,
+            max_demos=5,
             enable_augmentation=False,
             enable_translation=False,
             enable_resolution=False,
         )
         sample = ds[0]
         target = sample["target"]
-        # Most of the 64x64 canvas should be IGNORE_INDEX (grid is only 2x2)
         ignore_count = (target == IGNORE_INDEX).sum().item()
-        assert ignore_count > 64 * 64 - 20  # almost all padding
+        assert ignore_count > 64 * 64 - 20

@@ -1,198 +1,205 @@
-"""Unit tests for all ARC-IT model components.
+"""Unit tests for all ARC-IT Rule-Conditioned Transformer components.
 
-Tests verify shapes, gradients, and end-to-end integration on CPU/MPS.
-Uses stub encoder (no download needed) for fast local testing.
+Tests verify shapes, gradients, and end-to-end integration on CPU.
+No pretrained encoder downloads needed.
 
 Run with: python -m pytest tests/test_models.py -v
 """
 
 import pytest
 import torch
-import torch.nn as nn
 
-from arc_it.models.encoder import FrozenEncoder
-from arc_it.models.bridge import Bridge
-from arc_it.models.sana_backbone import (
-    LinearAttention,
+from arc_it.models.grid_tokenizer import GridTokenizer
+from arc_it.models.rule_encoder import (
+    StandardAttention,
     CrossAttention,
-    MixFFN,
-    SanaBlock,
-    SanaBackbone,
+    FFN,
+    PairEncoderBlock,
+    AggregatorBlock,
+    RuleEncoder,
 )
+from arc_it.models.rule_applier import RuleApplierBlock, RuleApplier
 from arc_it.models.decoder import SpatialDecoder
-from arc_it.models.arc_it_model import ARCITModel, InputEmbedder
+from arc_it.models.arc_it_model import ARCITModel
 
 
-B = 2    # batch size for tests
+B = 2    # batch size
 N = 256  # num patches (16x16)
-C = 1152 # Sana hidden size
+C = 128  # hidden size (small for tests)
+K = 3    # demo pairs
+M = 16   # rule tokens
 
 
-# ─── Encoder Tests ──────────────────────────────────────────────────
+# ─── GridTokenizer Tests ─────────────────────────────────────────────
 
-class TestEncoder:
-    def test_stub_encoder_shape(self):
-        enc = FrozenEncoder(encoder_name="stub", embed_dim=1024, num_patches=256)
-        x = torch.randn(B, 3, 224, 224)
-        out = enc(x)
-        assert out.shape == (B, 256, 1024)
-
-    def test_stub_encoder_frozen(self):
-        enc = FrozenEncoder(encoder_name="stub", embed_dim=1024)
-        for param in enc.parameters():
-            assert not param.requires_grad
-
-    def test_stub_encoder_no_grad(self):
-        enc = FrozenEncoder(encoder_name="stub", embed_dim=1024)
-        x = torch.randn(B, 3, 224, 224)
-        out = enc(x)
-        assert not out.requires_grad
-
-    def test_stub_encoder_eval_mode_persists(self):
-        enc = FrozenEncoder(encoder_name="stub", embed_dim=1024)
-        enc.train()
-        assert not enc.encoder.training
-
-
-# ─── Bridge Tests ───────────────────────────────────────────────────
-
-class TestBridge:
+class TestGridTokenizer:
     def test_shape(self):
-        bridge = Bridge(encoder_dim=1024, hidden_dim=2048, sana_dim=C)
-        x = torch.randn(B, N, 1024)
-        out = bridge(x)
-        assert out.shape == (B, N, C)
+        tok = GridTokenizer(num_colors=12, canvas_size=64, hidden_size=C, patch_size=4)
+        grid = torch.randint(0, 12, (B, 64, 64))
+        out = tok(grid)
+        assert out.shape == (B, 256, C)
 
     def test_gradients_flow(self):
-        bridge = Bridge(encoder_dim=1024, hidden_dim=2048, sana_dim=C)
-        x = torch.randn(B, N, 1024)
-        out = bridge(x)
-        loss = out.sum()
-        loss.backward()
-        for param in bridge.parameters():
-            if param.requires_grad:
-                assert param.grad is not None
+        tok = GridTokenizer(num_colors=12, canvas_size=64, hidden_size=C, patch_size=4)
+        grid = torch.randint(0, 12, (B, 64, 64))
+        out = tok(grid)
+        out.sum().backward()
+        for p in tok.parameters():
+            if p.requires_grad:
+                assert p.grad is not None
 
-    def test_pos_embed_shape(self):
-        bridge = Bridge(encoder_dim=1024, sana_dim=C, num_patches=N, use_2d_pos_embed=True)
-        assert bridge.pos_embed is not None
-        assert bridge.pos_embed.shape == (1, N, C)
-
-    def test_param_count(self):
-        bridge = Bridge(encoder_dim=1024, hidden_dim=2048, sana_dim=C)
-        n_params = sum(p.numel() for p in bridge.parameters())
-        assert n_params > 0
-        assert n_params < 20_000_000  # should be under 20M
+    def test_different_inputs_different_outputs(self):
+        tok = GridTokenizer(num_colors=12, canvas_size=64, hidden_size=C, patch_size=4)
+        g1 = torch.zeros(1, 64, 64, dtype=torch.long)
+        g2 = torch.ones(1, 64, 64, dtype=torch.long)
+        assert not torch.allclose(tok(g1), tok(g2))
 
 
-# ─── Sana Component Tests ──────────────────────────────────────────
+# ─── Attention Primitive Tests ───────────────────────────────────────
 
-class TestLinearAttention:
+class TestStandardAttention:
     def test_shape(self):
-        attn = LinearAttention(hidden_size=C, num_heads=36, head_dim=32)
+        attn = StandardAttention(hidden_size=C, num_heads=4)
         x = torch.randn(B, N, C)
         out = attn(x)
         assert out.shape == (B, N, C)
 
-    def test_output_changes_with_input(self):
-        attn = LinearAttention(hidden_size=C, num_heads=36, head_dim=32)
-        x1 = torch.randn(B, N, C)
-        x2 = torch.randn(B, N, C)
-        assert not torch.allclose(attn(x1), attn(x2))
+    def test_masking(self):
+        attn = StandardAttention(hidden_size=C, num_heads=4)
+        x = torch.randn(B, 10, C)
+        mask = torch.tensor([[True]*5 + [False]*5, [True]*8 + [False]*2])
+        out = attn(x, mask=mask)
+        assert out.shape == (B, 10, C)
 
 
 class TestCrossAttention:
     def test_shape(self):
-        ca = CrossAttention(hidden_size=C, num_heads=16)
+        ca = CrossAttention(hidden_size=C, num_heads=4)
         x = torch.randn(B, N, C)
-        cond = torch.randn(B, N, C)
-        out = ca(x, cond)
+        ctx = torch.randn(B, M, C)
+        out = ca(x, ctx)
         assert out.shape == (B, N, C)
 
-    def test_different_conditioning(self):
-        ca = CrossAttention(hidden_size=C, num_heads=16)
+    def test_different_context(self):
+        ca = CrossAttention(hidden_size=C, num_heads=4)
         x = torch.randn(B, N, C)
-        cond1 = torch.randn(B, N, C)
-        cond2 = torch.randn(B, N, C)
-        out1 = ca(x, cond1)
-        out2 = ca(x, cond2)
-        assert not torch.allclose(out1, out2)
+        c1 = torch.randn(B, M, C)
+        c2 = torch.randn(B, M, C)
+        assert not torch.allclose(ca(x, c1), ca(x, c2))
 
 
-class TestMixFFN:
+class TestFFN:
     def test_shape(self):
-        ffn = MixFFN(hidden_size=C, mlp_ratio=2.5)
+        ffn = FFN(hidden_size=C, mlp_ratio=2.5)
         x = torch.randn(B, N, C)
-        out = ffn(x)
-        assert out.shape == (B, N, C)
+        assert ffn(x).shape == (B, N, C)
 
 
-class TestSanaBlock:
+# ─── Rule Encoder Block Tests ───────────────────────────────────────
+
+class TestPairEncoderBlock:
     def test_shape(self):
-        block = SanaBlock(hidden_size=C, self_attn_heads=36, self_attn_head_dim=32)
-        x = torch.randn(B, N, C)
-        cond = torch.randn(B, N, C)
-        out = block(x, cond)
-        assert out.shape == (B, N, C)
+        block = PairEncoderBlock(hidden_size=C, num_heads=4)
+        out_tok = torch.randn(B, N, C)
+        in_tok = torch.randn(B, N, C)
+        result = block(out_tok, in_tok)
+        assert result.shape == (B, N, C)
+
+
+class TestAggregatorBlock:
+    def test_shape(self):
+        block = AggregatorBlock(hidden_size=C, num_heads=4)
+        x = torch.randn(B, K * N, C)
+        out = block(x)
+        assert out.shape == (B, K * N, C)
+
+    def test_with_mask(self):
+        block = AggregatorBlock(hidden_size=C, num_heads=4)
+        x = torch.randn(B, 20, C)
+        mask = torch.tensor([[True]*15 + [False]*5, [True]*20])
+        out = block(x, mask=mask)
+        assert out.shape == (B, 20, C)
+
+
+# ─── Full Rule Encoder Tests ────────────────────────────────────────
+
+class TestRuleEncoder:
+    def test_shape(self):
+        enc = RuleEncoder(
+            hidden_size=C, num_pair_layers=1, num_agg_layers=1,
+            num_heads=4, num_rule_tokens=M, max_demos=K, num_patches=N,
+        )
+        demo_in = torch.randn(B, K, N, C)
+        demo_out = torch.randn(B, K, N, C)
+        num_demos = torch.tensor([K, K])
+        rule_tokens = enc(demo_in, demo_out, num_demos)
+        assert rule_tokens.shape == (B, M, C)
+
+    def test_variable_demos(self):
+        enc = RuleEncoder(
+            hidden_size=C, num_pair_layers=1, num_agg_layers=1,
+            num_heads=4, num_rule_tokens=M, max_demos=5, num_patches=N,
+        )
+        demo_in = torch.randn(B, 5, N, C)
+        demo_out = torch.randn(B, 5, N, C)
+        num_demos = torch.tensor([2, 4])
+        rule_tokens = enc(demo_in, demo_out, num_demos)
+        assert rule_tokens.shape == (B, M, C)
 
     def test_gradients_flow(self):
-        block = SanaBlock(hidden_size=C, self_attn_heads=36, self_attn_head_dim=32)
-        x = torch.randn(B, N, C, requires_grad=True)
-        cond = torch.randn(B, N, C)
-        out = block(x, cond)
-        out.sum().backward()
-        assert x.grad is not None
+        enc = RuleEncoder(
+            hidden_size=C, num_pair_layers=1, num_agg_layers=1,
+            num_heads=4, num_rule_tokens=M, max_demos=K, num_patches=N,
+        )
+        demo_in = torch.randn(B, K, N, C, requires_grad=True)
+        demo_out = torch.randn(B, K, N, C, requires_grad=True)
+        num_demos = torch.tensor([K, K])
+        rule_tokens = enc(demo_in, demo_out, num_demos)
+        rule_tokens.sum().backward()
+        assert demo_in.grad is not None
+        assert demo_out.grad is not None
 
 
-class TestSanaBackbone:
-    def test_shape_small(self):
-        """Test with small depth for speed."""
-        backbone = SanaBackbone(hidden_size=C, depth=2, num_patches=N)
+# ─── Rule Applier Tests ─────────────────────────────────────────────
+
+class TestRuleApplierBlock:
+    def test_shape(self):
+        block = RuleApplierBlock(hidden_size=C, num_heads=4)
         x = torch.randn(B, N, C)
-        cond = torch.randn(B, N, C)
-        out = backbone(x, cond)
+        rules = torch.randn(B, M, C)
+        out = block(x, rules)
         assert out.shape == (B, N, C)
 
-    def test_depth_configurable(self):
-        for depth in [1, 4]:
-            backbone = SanaBackbone(hidden_size=C, depth=depth, num_patches=N)
-            assert len(backbone.blocks) == depth
+
+class TestRuleApplier:
+    def test_shape(self):
+        applier = RuleApplier(
+            hidden_size=C, num_layers=2, num_heads=4, num_patches=N,
+        )
+        test_tok = torch.randn(B, N, C)
+        rules = torch.randn(B, M, C)
+        out = applier(test_tok, rules)
+        assert out.shape == (B, N, C)
+
+    def test_different_rules_different_output(self):
+        applier = RuleApplier(hidden_size=C, num_layers=2, num_heads=4)
+        test_tok = torch.randn(B, N, C)
+        r1 = torch.randn(B, M, C)
+        r2 = torch.randn(B, M, C)
+        o1 = applier(test_tok, r1)
+        o2 = applier(test_tok, r2)
+        assert not torch.allclose(o1, o2)
 
 
 # ─── Decoder Tests ──────────────────────────────────────────────────
 
 class TestSpatialDecoder:
     def test_shape(self):
-        dec = SpatialDecoder(hidden_size=C, num_patches=N, canvas_size=64, num_colors=12)
+        dec = SpatialDecoder(hidden_size=C, num_patches=N, canvas_size=64, num_colors=12,
+                             hidden_channels=(64, 32))
         x = torch.randn(B, N, C)
         out = dec(x)
         assert out.shape == (B, 12, 64, 64)
-
-    def test_argmax_gives_valid_colors(self):
-        dec = SpatialDecoder(hidden_size=C, num_patches=N, canvas_size=64, num_colors=12)
-        x = torch.randn(B, N, C)
-        out = dec(x)
-        pred = out.argmax(dim=1)
-        assert pred.min() >= 0
-        assert pred.max() < 12
-
-    def test_gradients_flow(self):
-        dec = SpatialDecoder(hidden_size=C, num_patches=N, canvas_size=64, num_colors=12)
-        x = torch.randn(B, N, C, requires_grad=True)
-        out = dec(x)
-        out.sum().backward()
-        assert x.grad is not None
-
-
-# ─── Input Embedder Tests ──────────────────────────────────────────
-
-class TestInputEmbedder:
-    def test_shape(self):
-        emb = InputEmbedder(num_colors=12, canvas_size=64, hidden_size=C, patch_size=4)
-        grid = torch.randint(0, 12, (B, 64, 64))
-        out = emb(grid)
-        expected_patches = (64 // 4) ** 2  # 256
-        assert out.shape == (B, expected_patches, C)
 
 
 # ─── Full Model Integration ─────────────────────────────────────────
@@ -200,56 +207,58 @@ class TestInputEmbedder:
 class TestARCITModel:
     @pytest.fixture
     def model(self):
-        """Create a small model for testing (2 Sana layers instead of 28)."""
+        """Small model for testing."""
         return ARCITModel(
-            encoder_name="stub",
-            encoder_dim=1024,
-            encoder_pretrained=False,
-            sana_hidden=256,      # Small for testing
-            sana_depth=2,         # 2 layers instead of 28
-            sana_self_attn_heads=8,
-            sana_self_attn_head_dim=32,
-            sana_cross_attn_heads=4,
-            sana_mlp_ratio=2.0,
-            canvas_size=64,
             num_colors=12,
-            decoder_channels=(128, 64),
+            canvas_size=64,
+            patch_size=4,
+            hidden_size=C,
+            rule_encoder_pair_layers=1,
+            rule_encoder_agg_layers=1,
+            rule_encoder_heads=4,
+            num_rule_tokens=M,
+            max_demos=5,
+            rule_applier_layers=1,
+            rule_applier_heads=4,
+            decoder_channels=(64, 32),
+            mlp_ratio=2.0,
         )
 
-    def test_training_forward(self, model):
-        input_rgb = torch.randn(B, 3, 224, 224)
-        input_canvas = torch.randint(0, 12, (B, 64, 64))
+    def _make_batch(self, num_demos=3, max_demos=5):
+        di = torch.randint(0, 12, (B, max_demos, 64, 64))
+        do = torch.randint(0, 12, (B, max_demos, 64, 64))
+        qi = torch.randint(0, 12, (B, 64, 64))
+        nd = torch.tensor([num_demos] * B)
         target = torch.randint(0, 10, (B, 64, 64))
-        result = model(input_rgb, input_canvas, target=target)
+        return di, do, qi, nd, target
+
+    def test_training_forward(self, model):
+        di, do, qi, nd, target = self._make_batch()
+        result = model(di, do, qi, nd, target=target)
         assert "loss" in result
         assert "pixel_accuracy" in result
         assert "logits" in result
         assert result["logits"].shape == (B, 12, 64, 64)
-        assert result["loss"].ndim == 0  # scalar
+        assert result["loss"].ndim == 0
 
     def test_training_loss_is_finite(self, model):
-        input_rgb = torch.randn(B, 3, 224, 224)
-        input_canvas = torch.randint(0, 12, (B, 64, 64))
-        target = torch.randint(0, 10, (B, 64, 64))
-        result = model(input_rgb, input_canvas, target=target)
+        di, do, qi, nd, target = self._make_batch()
+        result = model(di, do, qi, nd, target=target)
         assert torch.isfinite(result["loss"])
 
     def test_training_backward(self, model):
-        input_rgb = torch.randn(B, 3, 224, 224)
-        input_canvas = torch.randint(0, 12, (B, 64, 64))
-        target = torch.randint(0, 10, (B, 64, 64))
-        result = model(input_rgb, input_canvas, target=target)
+        di, do, qi, nd, target = self._make_batch()
+        result = model(di, do, qi, nd, target=target)
         result["loss"].backward()
-        trainable_params = model.get_trainable_params()
-        assert len(trainable_params) > 0
-        grads_ok = sum(1 for p in trainable_params if p.grad is not None)
+        trainable = model.get_trainable_params()
+        assert len(trainable) > 0
+        grads_ok = sum(1 for p in trainable if p.grad is not None)
         assert grads_ok > 0
 
     def test_inference_forward(self, model):
         model.eval()
-        input_rgb = torch.randn(B, 3, 224, 224)
-        input_canvas = torch.randint(0, 12, (B, 64, 64))
-        result = model(input_rgb, input_canvas)
+        di, do, qi, nd, _ = self._make_batch()
+        result = model(di, do, qi, nd)
         assert "prediction" in result
         assert "logits" in result
         assert result["prediction"].shape == (B, 64, 64)
@@ -258,56 +267,48 @@ class TestARCITModel:
         assert result["prediction"].max() < 12
 
     def test_difficulty_weighting(self, model):
-        input_rgb = torch.randn(B, 3, 224, 224)
-        input_canvas = torch.randint(0, 12, (B, 64, 64))
-        target = torch.randint(0, 10, (B, 64, 64))
-
-        # Without difficulty
-        r1 = model(input_rgb, input_canvas, target=target)
-
-        # With high difficulty weight
+        di, do, qi, nd, target = self._make_batch()
+        r1 = model(di, do, qi, nd, target=target)
         difficulty = torch.tensor([10.0, 10.0])
-        r2 = model(input_rgb, input_canvas, target=target, difficulty=difficulty)
-
-        # Weighted loss should be higher
+        r2 = model(di, do, qi, nd, target=target, difficulty=difficulty)
         assert r2["loss"] > r1["loss"]
 
-    def test_encoder_frozen_after_training_step(self, model):
-        input_rgb = torch.randn(B, 3, 224, 224)
-        input_canvas = torch.randint(0, 12, (B, 64, 64))
-        target = torch.randint(0, 10, (B, 64, 64))
-        result = model(input_rgb, input_canvas, target=target)
-        result["loss"].backward()
-        for param in model.encoder.parameters():
-            assert not param.requires_grad
+    def test_variable_num_demos(self, model):
+        di, do, qi, _, target = self._make_batch(max_demos=5)
+        nd = torch.tensor([1, 4])
+        result = model(di, do, qi, nd, target=target)
+        assert torch.isfinite(result["loss"])
 
     def test_param_count(self, model):
         counts = model.param_count()
-        assert counts["encoder"]["trainable"] == 0
-        assert counts["bridge"]["trainable"] > 0
-        assert counts["sana"]["trainable"] > 0
+        assert counts["tokenizer"]["trainable"] > 0
+        assert counts["rule_encoder"]["trainable"] > 0
+        assert counts["rule_applier"]["trainable"] > 0
         assert counts["decoder"]["trainable"] > 0
-        assert counts["_total"]["trainable"] > 0
-        assert counts["_total"]["trainable"] < counts["_total"]["total"]
+        # All params should be trainable (no frozen encoder)
+        assert counts["_total"]["trainable"] == counts["_total"]["total"]
 
     def test_from_config(self):
         config = {
-            "data": {"canvas_size": 64, "num_colors": 12},
+            "data": {"canvas_size": 64, "num_colors": 12, "max_demos": 5},
             "model": {
-                "encoder": {"name": "stub", "embed_dim": 1024, "pretrained": False, "num_patches": 256},
-                "bridge": {"hidden_dim": 512, "output_dim": 256, "dropout": 0.1, "use_2d_pos_embed": True},
-                "sana": {
-                    "hidden_size": 256, "depth": 2, "num_heads": 4,
-                    "linear_head_dim": 32, "mlp_ratio": 2.0,
-                    "attn_type": "linear", "ffn_type": "glumbconv",
+                "hidden_size": 128,
+                "mlp_ratio": 2.0,
+                "tokenizer": {"patch_size": 4},
+                "rule_encoder": {
+                    "pair_layers": 1, "agg_layers": 1,
+                    "num_heads": 4, "num_rule_tokens": 16,
                 },
-                "decoder": {"hidden_channels": [128, 64], "upsample_method": "transposed_conv"},
+                "rule_applier": {"num_layers": 1, "num_heads": 4},
+                "decoder": {"hidden_channels": [64, 32]},
             },
         }
         model = ARCITModel.from_config(config)
         assert model is not None
-        input_rgb = torch.randn(1, 3, 224, 224)
-        input_canvas = torch.randint(0, 12, (1, 64, 64))
+        di = torch.randint(0, 12, (1, 5, 64, 64))
+        do = torch.randint(0, 12, (1, 5, 64, 64))
+        qi = torch.randint(0, 12, (1, 64, 64))
+        nd = torch.tensor([2])
         target = torch.randint(0, 10, (1, 64, 64))
-        result = model(input_rgb, input_canvas, target=target)
+        result = model(di, do, qi, nd, target=target)
         assert torch.isfinite(result["loss"])

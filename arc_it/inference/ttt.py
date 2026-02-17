@@ -1,14 +1,18 @@
-"""Test-Time Training (TTT) for ARC-IT.
+"""Test-Time Training (TTT) for the Rule-Conditioned Transformer.
 
 Per-task adaptation: for each evaluation task, fine-tune the model
-on the task's demonstration examples (2-5 input/output pairs) before
-making predictions. Includes tqdm progress bars for all loops.
+on augmented versions of the task's demonstration examples before
+making predictions.
+
+The Rule-Conditioned architecture makes TTT more natural: the demo
+pairs are already part of the forward pass, so TTT fine-tunes the
+rule encoder to better extract rules from THIS task's specific demos.
 
 Workflow per task:
     1. Snapshot model weights
-    2. Augment demonstration examples (geometric + color perms)
-    3. Fine-tune last N Sana layers + Bridge + Decoder for K steps
-    4. Generate predictions (direct forward pass, no diffusion)
+    2. Create augmented training data (leave-one-out on demo pairs)
+    3. Fine-tune rule_encoder + rule_applier + decoder for K steps
+    4. Generate predictions with augmentation voting
     5. Restore original weights for next task
 """
 
@@ -20,7 +24,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from arc_it.data.augmentation import (
@@ -35,10 +38,7 @@ from arc_it.data.canvas import (
     pad_grid_to_canvas,
     crop_prediction_from_canvas,
     random_offset,
-    resolution_scale,
-    random_scale_factor,
 )
-from arc_it.data.rendering import render_canvas_to_rgb_224
 from arc_it.models.arc_it_model import ARCITModel
 from arc_it.utils.device import get_device
 
@@ -52,18 +52,18 @@ class TestTimeTrainer:
         ttt_steps: int = 100,
         ttt_lr: float = 1e-4,
         ttt_batch_size: int = 8,
-        num_layers_to_update: int = 4,
         num_candidates: int = 32,
         canvas_size: int = 64,
+        max_demos: int = 5,
         device: Optional[torch.device] = None,
     ) -> None:
         self.model = model.to(device or get_device())
         self.ttt_steps = ttt_steps
         self.ttt_lr = ttt_lr
         self.ttt_batch_size = ttt_batch_size
-        self.num_layers_to_update = num_layers_to_update
         self.num_candidates = num_candidates
         self.canvas_size = canvas_size
+        self.max_demos = max_demos
         self.device = device or get_device()
 
     def predict_task(
@@ -73,12 +73,14 @@ class TestTimeTrainer:
     ) -> List[List[List[int]]]:
         """Predict test output(s) for a single ARC task with TTT."""
         snapshot = self._snapshot_weights()
+
         train_data = self._prepare_ttt_data(task["train"])
         self._fine_tune(train_data)
 
         predictions = []
         for test_example in task["test"]:
             candidates = self._generate_candidates(
+                task["train"],
                 test_example["input"],
                 num_candidates=self.num_candidates,
             )
@@ -95,66 +97,117 @@ class TestTimeTrainer:
         self,
         train_examples: List[Dict],
     ) -> Dict[str, torch.Tensor]:
-        """Create augmented training batches from demonstration examples."""
+        """Create augmented training batches using leave-one-out.
+
+        For each training example, hold it out as the query and use
+        the rest as demos. Apply geometric + color augmentation.
+        """
         rng = np.random.RandomState(42)
         geos = get_geometric_augmentations()
+        K = len(train_examples)
 
-        all_input_rgb = []
-        all_input_canvas = []
+        all_demo_inputs = []
+        all_demo_outputs = []
+        all_query_inputs = []
         all_targets = []
+        all_num_demos = []
 
-        for example in train_examples:
-            inp = example["input"]
-            out = example["output"]
+        for hold_out_idx in range(K):
+            query = train_examples[hold_out_idx]
+            demos = [ex for i, ex in enumerate(train_examples) if i != hold_out_idx]
 
             for geo_name, geo_fn in geos:
-                aug_inp = geo_fn(inp)
-                aug_out = geo_fn(out)
-
                 perm = random_color_permutation(rng, keep_background=True)
-                aug_inp = permute_colors(aug_inp, perm)
-                aug_out = permute_colors(aug_out, perm)
 
-                h_in, w_in = len(aug_inp), len(aug_inp[0])
-                h_out, w_out = len(aug_out), len(aug_out[0])
-                max_h, max_w = max(h_in, h_out), max(w_in, w_out)
+                # Augment demos
+                aug_demos = []
+                for d in demos:
+                    aug_in = permute_colors(geo_fn(d["input"]), perm)
+                    aug_out = permute_colors(geo_fn(d["output"]), perm)
+                    aug_demos.append({"input": aug_in, "output": aug_out})
+
+                # Augment query
+                aug_q_in = permute_colors(geo_fn(query["input"]), perm)
+                aug_q_out = permute_colors(geo_fn(query["output"]), perm)
+
+                # Find max dims
+                all_grids = []
+                for d in aug_demos:
+                    all_grids.extend([d["input"], d["output"]])
+                all_grids.extend([aug_q_in, aug_q_out])
+                max_h = max(len(g) for g in all_grids)
+                max_w = max(max(len(r) for r in g) for g in all_grids)
 
                 x_off, y_off = random_offset(max_h, max_w, self.canvas_size, rng)
 
-                input_canvas, _, _, _ = pad_grid_to_canvas(
-                    aug_inp, self.canvas_size, x_off, y_off, mark_boundary=False
-                )
-                output_canvas, output_mask, _, _ = pad_grid_to_canvas(
-                    aug_out, self.canvas_size, x_off, y_off, mark_boundary=True
-                )
-                target = output_canvas.clone()
-                target[output_mask == 0] = IGNORE_INDEX
+                # Place demos on canvas
+                demo_in_list = []
+                demo_out_list = []
+                for d in aug_demos[:self.max_demos]:
+                    d_in, _, _, _ = pad_grid_to_canvas(
+                        d["input"], self.canvas_size, x_off, y_off,
+                        mark_boundary=False,
+                    )
+                    d_out, _, _, _ = pad_grid_to_canvas(
+                        d["output"], self.canvas_size, x_off, y_off,
+                        mark_boundary=True,
+                    )
+                    demo_in_list.append(d_in)
+                    demo_out_list.append(d_out)
 
-                input_rgb = render_canvas_to_rgb_224(input_canvas, normalize=True)
-                all_input_rgb.append(input_rgb)
-                all_input_canvas.append(input_canvas)
-                all_targets.append(target)
+                nd = len(demo_in_list)
+                while len(demo_in_list) < self.max_demos:
+                    demo_in_list.append(
+                        torch.full((self.canvas_size, self.canvas_size),
+                                   IGNORE_INDEX, dtype=torch.long)
+                    )
+                    demo_out_list.append(
+                        torch.full((self.canvas_size, self.canvas_size),
+                                   IGNORE_INDEX, dtype=torch.long)
+                    )
+
+                # Place query on canvas
+                q_in, _, _, _ = pad_grid_to_canvas(
+                    aug_q_in, self.canvas_size, x_off, y_off,
+                    mark_boundary=False,
+                )
+                q_out, q_mask, _, _ = pad_grid_to_canvas(
+                    aug_q_out, self.canvas_size, x_off, y_off,
+                    mark_boundary=True,
+                )
+                q_target = q_out.clone()
+                q_target[q_mask == 0] = IGNORE_INDEX
+
+                all_demo_inputs.append(torch.stack(demo_in_list))
+                all_demo_outputs.append(torch.stack(demo_out_list))
+                all_query_inputs.append(q_in)
+                all_targets.append(q_target)
+                all_num_demos.append(torch.tensor(nd, dtype=torch.long))
 
         return {
-            "input_rgb_224": torch.stack(all_input_rgb),
-            "input_canvas": torch.stack(all_input_canvas),
+            "demo_inputs": torch.stack(all_demo_inputs),
+            "demo_outputs": torch.stack(all_demo_outputs),
+            "query_input": torch.stack(all_query_inputs),
             "target": torch.stack(all_targets),
+            "num_demos": torch.stack(all_num_demos),
         }
 
     # ─── Fine-tuning ─────────────────────────────────────────────
 
     def _fine_tune(self, train_data: Dict[str, torch.Tensor]) -> None:
-        """Fine-tune model on augmented demonstration data with progress bar."""
+        """Fine-tune model on augmented task data."""
         self.model.train()
         self._set_ttt_trainable()
 
         params = [p for p in self.model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=self.ttt_lr, weight_decay=0)
 
-        input_rgb = train_data["input_rgb_224"].to(self.device)
-        input_canvas = train_data["input_canvas"].to(self.device)
+        demo_inputs = train_data["demo_inputs"].to(self.device)
+        demo_outputs = train_data["demo_outputs"].to(self.device)
+        query_inputs = train_data["query_input"].to(self.device)
         targets = train_data["target"].to(self.device)
-        n_samples = input_rgb.shape[0]
+        num_demos = train_data["num_demos"].to(self.device)
+        n_samples = demo_inputs.shape[0]
 
         pbar = tqdm(
             range(self.ttt_steps),
@@ -164,13 +217,17 @@ class TestTimeTrainer:
         )
 
         for step in pbar:
-            indices = torch.randint(0, n_samples, (min(self.ttt_batch_size, n_samples),))
-            batch_rgb = input_rgb[indices]
-            batch_canvas = input_canvas[indices]
-            batch_target = targets[indices]
-
+            indices = torch.randint(
+                0, n_samples, (min(self.ttt_batch_size, n_samples),)
+            )
             optimizer.zero_grad()
-            result = self.model(batch_rgb, batch_canvas, target=batch_target)
+            result = self.model(
+                demo_inputs[indices],
+                demo_outputs[indices],
+                query_inputs[indices],
+                num_demos[indices],
+                target=targets[indices],
+            )
             result["loss"].backward()
             nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
@@ -182,36 +239,23 @@ class TestTimeTrainer:
         self.model.eval()
 
     def _set_ttt_trainable(self) -> None:
-        """Freeze everything except last N Sana layers + bridge + decoder."""
+        """Make all parameters trainable for TTT."""
         for param in self.model.parameters():
-            param.requires_grad = False
-
-        for param in self.model.bridge.parameters():
             param.requires_grad = True
-        for param in self.model.decoder.parameters():
-            param.requires_grad = True
-        for param in self.model.input_embedder.parameters():
-            param.requires_grad = True
-
-        n_blocks = len(self.model.sana.blocks)
-        start = max(0, n_blocks - self.num_layers_to_update)
-        for block in self.model.sana.blocks[start:]:
-            for param in block.parameters():
-                param.requires_grad = True
 
     # ─── Candidate Generation ────────────────────────────────────
 
     @torch.no_grad()
     def _generate_candidates(
         self,
+        train_examples: List[Dict],
         input_grid: List[List[int]],
         num_candidates: int = 32,
     ) -> List[List[List[int]]]:
-        """Generate multiple candidate predictions via augmentation voting.
+        """Generate candidate predictions via augmentation voting.
 
-        Since there's no stochastic diffusion, we generate diversity by
-        applying geometric augmentations to the input, predicting, and
-        then inverting the augmentation on the output.
+        Apply geometric + color augmentations to both demos and test
+        input, predict, then invert the augmentation on the output.
         """
         self.model.eval()
         rng = np.random.RandomState(123)
@@ -224,44 +268,92 @@ class TestTimeTrainer:
             leave=False,
             dynamic_ncols=True,
         )
+
         for i in pbar:
-            # Pick a random geometric augmentation
             geo_name, geo_fn = geos[i % len(geos)]
             inv_fn = get_inverse_geometric(geo_name)
 
-            # Optionally apply color permutation for more diversity
             if i >= len(geos):
                 color_perm = random_color_permutation(rng, keep_background=True)
-                inv_color_perm = inverse_color_permutation(color_perm)
+                inv_color = inverse_color_permutation(color_perm)
             else:
                 color_perm = None
-                inv_color_perm = None
+                inv_color = None
 
-            # Augment input
-            aug_input = geo_fn(input_grid)
-            if color_perm is not None:
-                aug_input = permute_colors(aug_input, color_perm)
+            # Augment demos
+            aug_demos = []
+            for ex in train_examples:
+                aug_in = geo_fn(ex["input"])
+                aug_out = geo_fn(ex["output"])
+                if color_perm:
+                    aug_in = permute_colors(aug_in, color_perm)
+                    aug_out = permute_colors(aug_out, color_perm)
+                aug_demos.append({"input": aug_in, "output": aug_out})
 
-            # Embed and predict
-            input_canvas, _, _, _ = pad_grid_to_canvas(
-                aug_input, self.canvas_size, x_offset=1, y_offset=1, mark_boundary=False
+            # Augment test input
+            aug_test = geo_fn(input_grid)
+            if color_perm:
+                aug_test = permute_colors(aug_test, color_perm)
+
+            # Find max dims
+            all_grids = []
+            for d in aug_demos:
+                all_grids.extend([d["input"], d["output"]])
+            all_grids.append(aug_test)
+            max_h = max(len(g) for g in all_grids)
+            max_w = max(max(len(r) for r in g) for g in all_grids)
+
+            x_off, y_off = 1, 1
+
+            # Place on canvas
+            demo_in_list = []
+            demo_out_list = []
+            for d in aug_demos[:self.max_demos]:
+                d_in, _, _, _ = pad_grid_to_canvas(
+                    d["input"], self.canvas_size, x_off, y_off,
+                    mark_boundary=False,
+                )
+                d_out, _, _, _ = pad_grid_to_canvas(
+                    d["output"], self.canvas_size, x_off, y_off,
+                    mark_boundary=True,
+                )
+                demo_in_list.append(d_in)
+                demo_out_list.append(d_out)
+
+            nd = len(demo_in_list)
+            while len(demo_in_list) < self.max_demos:
+                demo_in_list.append(
+                    torch.full((self.canvas_size, self.canvas_size),
+                               IGNORE_INDEX, dtype=torch.long)
+                )
+                demo_out_list.append(
+                    torch.full((self.canvas_size, self.canvas_size),
+                               IGNORE_INDEX, dtype=torch.long)
+                )
+
+            q_in, _, _, _ = pad_grid_to_canvas(
+                aug_test, self.canvas_size, x_off, y_off,
+                mark_boundary=False,
             )
-            input_rgb = render_canvas_to_rgb_224(input_canvas, normalize=True)
-            input_rgb = input_rgb.unsqueeze(0).to(self.device)
-            input_canvas_t = input_canvas.unsqueeze(0).to(self.device)
 
-            result = self.model(input_rgb, input_canvas_t)
+            # Forward pass
+            di = torch.stack(demo_in_list).unsqueeze(0).to(self.device)
+            do = torch.stack(demo_out_list).unsqueeze(0).to(self.device)
+            qi = q_in.unsqueeze(0).to(self.device)
+            nd_t = torch.tensor([nd], dtype=torch.long, device=self.device)
+
+            result = self.model(di, do, qi, nd_t)
             pred = result["prediction"][0].cpu()
-            grid = crop_prediction_from_canvas(pred, x_offset=1, y_offset=1)
+            grid = crop_prediction_from_canvas(pred, x_offset=x_off, y_offset=y_off)
 
             # Invert augmentations
-            if inv_color_perm is not None:
-                grid = permute_colors(grid, inv_color_perm)
+            if inv_color is not None:
+                grid = permute_colors(grid, inv_color)
             grid = inv_fn(grid)
 
             candidates.append(grid)
-        pbar.close()
 
+        pbar.close()
         return candidates
 
     # ─── Candidate Scoring ───────────────────────────────────────
@@ -271,7 +363,6 @@ class TestTimeTrainer:
         candidates: List[List[List[int]]],
     ) -> List[List[List[int]]]:
         """Score and rank candidates by frequency (majority voting)."""
-        # Count how often each unique prediction appears
         counts = {}
         for grid in candidates:
             key = str(grid)
@@ -279,19 +370,17 @@ class TestTimeTrainer:
                 counts[key] = {"grid": grid, "count": 0, "score": 0.0}
             counts[key]["count"] += 1
 
-        # Score = frequency + heuristic quality
         for key, info in counts.items():
             freq_score = info["count"] / len(candidates)
             quality_score = self._compute_grid_score(info["grid"])
             info["score"] = 0.7 * freq_score + 0.3 * quality_score
 
-        # Sort by score (frequency-weighted)
         ranked = sorted(counts.values(), key=lambda x: x["score"], reverse=True)
         return [item["grid"] for item in ranked]
 
     @staticmethod
     def _compute_grid_score(grid: List[List[int]]) -> float:
-        """Score a predicted grid using heuristic quality metrics."""
+        """Heuristic quality metrics for a predicted grid."""
         if not grid or not grid[0]:
             return 0.0
 
@@ -319,10 +408,8 @@ class TestTimeTrainer:
     # ─── Weight Snapshot/Restore ─────────────────────────────────
 
     def _snapshot_weights(self) -> Dict[str, torch.Tensor]:
-        """Save current model weights."""
         return copy.deepcopy(self.model.state_dict())
 
     def _restore_weights(self, snapshot: Dict[str, torch.Tensor]) -> None:
-        """Restore model to a previous weight snapshot."""
         self.model.load_state_dict(snapshot)
         self.model.eval()

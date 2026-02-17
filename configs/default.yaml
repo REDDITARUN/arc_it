@@ -1,5 +1,5 @@
-# ARC-IT Default Configuration
-# Auto-adapts to Mac (dev) vs H100 (training) based on device detection
+# ARC-IT: Rule-Conditioned Transformer Configuration
+# Auto-adapts to Mac (dev) vs H100/A100 (training) based on device detection
 
 # ─── Data ───────────────────────────────────────────────────────────
 data:
@@ -8,7 +8,8 @@ data:
   canvas_size: 64                # Fixed canvas for all grids (VARC-proven)
   num_colors: 12                 # 10 ARC + IGNORE + PAD
   max_grid_size: 30              # Max raw grid dimension
-  repeat_factor: 1               # Use natural epochs with on-the-fly augmentation (VARC-style)
+  max_demos: 5                   # Max demonstration pairs per task
+  repeat_factor: 1               # Use natural epochs with on-the-fly augmentation
 
   augmentation:
     geometric: true              # 8 variants (rotations + flips + transpose)
@@ -20,65 +21,47 @@ data:
 
 # ─── Model ──────────────────────────────────────────────────────────
 model:
-  # I-JEPA Encoder (FROZEN) — predictive spatial features for pattern completion
-  encoder:
-    name: "ijepa_vith14_1k"     # I-JEPA ViT-H/14 (ImageNet-1K)
-    pretrained: true
-    frozen: true
-    input_size: 224              # ViT expects 224x224
-    embed_dim: 1280              # I-JEPA ViT-H output dimension
-    num_patches: 256             # (224/14)^2
+  hidden_size: 384               # Shared hidden dimension (~20M total params)
+  mlp_ratio: 2.5                 # FFN expansion ratio
 
-  # Bridge Module (TRAINABLE)
-  bridge:
-    hidden_dim: 2560             # Intermediate expansion (2x encoder_dim)
-    output_dim: 1152             # Must match Sana hidden_size
-    dropout: 0.1
-    use_2d_pos_embed: true       # Learnable 16x16 positional embeddings
+  # Grid Tokenizer (shared for all grids)
+  tokenizer:
+    patch_size: 4                # 64/4 = 16x16 patches = 256 tokens per grid
 
-  # Sana Transformer Backbone (TRAINABLE)
-  sana:
-    hidden_size: 1152            # Sana-0.6B native size
-    depth: 28                    # Number of transformer blocks
-    num_heads: 16                # Attention heads
-    linear_head_dim: 32          # For linear attention (LiteLA)
-    mlp_ratio: 2.5               # FFN expansion ratio
-    attn_type: "linear"          # linear | flash
-    ffn_type: "glumbconv"        # glumbconv | mlp
-    pretrained: false            # Train Sana from random init (pretrained was text-to-image, hurts ARC)
+  # Rule Encoder — extracts transformation rule from demo pairs
+  rule_encoder:
+    pair_layers: 2               # Per-pair cross-attention layers
+    agg_layers: 2                # Cross-pair aggregation layers
+    num_heads: 8                 # Attention heads (384/8 = 48 dim/head)
+    num_rule_tokens: 64          # Fixed-length rule representation
 
-  # Spatial Decoder (TRAINABLE)
+  # Rule Applier — applies rule to test input
+  rule_applier:
+    num_layers: 4                # Transformer decoder layers
+    num_heads: 8                 # Attention heads
+
+  # Spatial Decoder (tokens → 64x64 grid logits)
   decoder:
-    upsample_method: "transposed_conv"  # transposed_conv | interpolate
-    hidden_channels: [512, 256]         # Channel sizes for upsampling layers
+    upsample_method: "transposed_conv"
+    hidden_channels: [192, 96]   # Matched to hidden_size=384
 
 # ─── Training ───────────────────────────────────────────────────────
 training:
   # Auto-scaled by device (these are A100/H100 defaults)
-  batch_size: 64                 # Mac override: 4
+  batch_size: 32                 # Mac override: 4 (task-level = more memory per sample)
   num_workers: 8                 # Mac override: 0
-  epochs: 70                     # Total across all stages
   gradient_clip: 1.0
-  gradient_checkpointing: true   # Mac: false (not needed)
 
-  # Three-stage schedule
+  # Two-stage schedule (no frozen encoder to warm up)
   stage1:
-    name: "bridge_alignment"
-    epochs: 10
-    lr: 2.0e-4                   # Higher LR for fresh bridge weights
-    freeze_sana: true
+    name: "full_training"
+    epochs: 50                   # Main training phase
+    lr: 3.0e-4                   # Higher LR since all 20M params are trainable
 
   stage2:
-    name: "full_training"
-    epochs: 50                   # Much longer to converge (VARC uses 100 total)
-    lr: 1.0e-4                   # Higher initial LR, cosine will decay
-    freeze_sana: false
-
-  stage3:
     name: "hard_focus"
     epochs: 10
-    lr: 1.0e-5
-    freeze_sana: false
+    lr: 3.0e-5
     agi2_oversample: 2.0         # 2x weight on AGI-2 tasks
 
   optimizer:
@@ -92,7 +75,7 @@ training:
 
   # Logging & Checkpointing
   log_every_n_steps: 100
-  save_every_n_epochs: 10        # Save periodic checkpoints every 10 epochs
+  save_every_n_epochs: 10
   checkpoint_dir: "checkpoints"
 
 # ─── Test-Time Training ─────────────────────────────────────────────
@@ -101,11 +84,10 @@ ttt:
   steps: 100                     # Fine-tuning steps per task
   lr: 1.0e-4
   batch_size: 8                  # Mac: 2
-  num_layers_to_update: 4        # Last N Sana layers
   num_candidates: 32             # Augmentation-based candidate generation
 
 # ─── Evaluation ─────────────────────────────────────────────────────
 evaluation:
-  val_split_ratio: 0.1           # Hold out 10% for validation
+  val_split_ratio: 0.1
   metrics: ["pixel_accuracy", "grid_exact_match"]
   visualize_every_n_tasks: 50

@@ -1,9 +1,16 @@
 """
-ARC-IT: JEPA + Sana Hybrid Architecture for ARC-AGI Benchmarks
+ARC-IT: Rule-Conditioned Transformer for ARC-AGI Benchmarks
 
-A hybrid neural architecture that solves abstract reasoning tasks (ARC-AGI)
-by combining a frozen JEPA/DINOv2 encoder for spatial understanding with
-Sana's linear-attention transformer for direct output prediction.
+A novel architecture that explicitly extracts transformation rules from
+demonstration pairs via paired cross-attention, then applies those rules
+to new inputs. This mirrors how humans solve ARC: look at what changed
+across examples, then apply that pattern.
+
+Key components:
+    - GridTokenizer: Discrete grid → continuous patch tokens
+    - RuleEncoder: Demo pairs → rule tokens (paired cross-attention)
+    - RuleApplier: Test input × rule tokens → output tokens
+    - SpatialDecoder: Output tokens → 64x64 grid logits
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
