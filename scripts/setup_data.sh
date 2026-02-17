@@ -51,14 +51,19 @@ else
     # Extract the pre-generated dataset from the zip
     if [ -f "re_arc.zip" ]; then
         echo "  Extracting re_arc.zip..."
-        unzip -q re_arc.zip -d ../RE-ARC-tmp
-        # Move tasks/ to the right place
-        if [ -d "../RE-ARC-tmp/re_arc/tasks" ]; then
-            mv ../RE-ARC-tmp/re_arc/tasks ../RE-ARC/tasks
-        elif [ -d "../RE-ARC-tmp/tasks" ]; then
-            mv ../RE-ARC-tmp/tasks ../RE-ARC/tasks
-        fi
-        rm -rf ../RE-ARC-tmp
+        # Use Python's zipfile (always available) as fallback for unzip
+        python3 -c "
+import zipfile, shutil, os
+with zipfile.ZipFile('re_arc.zip', 'r') as z:
+    z.extractall('../RE-ARC-tmp')
+# Find and move the tasks/ directory
+for root, dirs, files in os.walk('../RE-ARC-tmp'):
+    if 'tasks' in dirs:
+        shutil.move(os.path.join(root, 'tasks'), '../RE-ARC/tasks')
+        break
+shutil.rmtree('../RE-ARC-tmp', ignore_errors=True)
+print(f'  Extracted {len(os.listdir(\"../RE-ARC/tasks\"))} task files')
+"
     else
         echo "  Warning: re_arc.zip not found, generating dataset..."
         echo "  This requires Python and may take a while."
