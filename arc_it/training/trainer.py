@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 from arc_it.models.arc_it_model import ARCITModel
 from arc_it.training.loss import compute_loss
-from arc_it.data.dataset import build_dataloaders
+from arc_it.data.dataset import build_dataloaders, build_eval_dataloader
 from arc_it.utils.device import get_device, get_dtype, get_amp_enabled
 
 
@@ -156,12 +156,8 @@ class Trainer:
 
     def _build_val_loader(self) -> None:
         """Build validation DataLoader (always on real ARC data)."""
-        eval_cfg = self.config.get("evaluation", {})
-        val_sources = eval_cfg.get("val_data_sources", ["agi1", "agi2"])
         try:
-            _, _, val_ds, val_loader = build_dataloaders(
-                self.config, data_sources=val_sources
-            )
+            val_ds, val_loader = build_eval_dataloader(self.config)
             self.val_loader = val_loader
             if val_ds:
                 print(f"  Val: {len(val_ds)} samples")

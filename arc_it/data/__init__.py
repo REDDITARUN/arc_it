@@ -25,4 +25,4 @@ from arc_it.data.rendering import (
     render_canvas_to_rgb_224,
     batch_render_canvas_to_rgb_224,
 )
-from arc_it.data.dataset import ARCTaskDataset, collate_fn, build_dataloaders
+from arc_it.data.dataset import ARCTaskDataset, collate_fn, build_dataloaders, build_eval_dataloader

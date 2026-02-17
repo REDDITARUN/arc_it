@@ -496,3 +496,54 @@ def build_dataloaders(
             )
 
     return train_dataset, train_loader, eval_dataset, eval_loader
+
+
+def build_eval_dataloader(
+    config: Dict[str, Any],
+    data_sources: Optional[List[str]] = None,
+) -> Tuple[Optional["ARCTaskDataset"], Optional[DataLoader]]:
+    """Build only the eval dataloader (no train dataset created).
+
+    Args:
+        config: Full config dict.
+        data_sources: Source names for eval data. Defaults to ["agi1", "agi2"].
+
+    Returns:
+        (eval_dataset, eval_loader) or (None, None) if no data found.
+    """
+    data_cfg = config["data"]
+    train_cfg = config["training"]
+
+    if data_sources is None:
+        eval_cfg = config.get("evaluation", {})
+        data_sources = eval_cfg.get("val_data_sources", ["agi1", "agi2"])
+
+    val_roots = _resolve_data_roots(data_cfg, data_sources)
+    if not val_roots:
+        return None, None
+
+    canvas_size = data_cfg["canvas_size"]
+    max_demos = data_cfg.get("max_demos", 5)
+
+    eval_dataset = ARCTaskDataset(
+        data_roots=val_roots,
+        split="training",
+        subset="test",
+        canvas_size=canvas_size,
+        max_demos=max_demos,
+        enable_augmentation=False,
+        enable_translation=False,
+        enable_resolution=False,
+    )
+
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=train_cfg["batch_size"],
+        shuffle=False,
+        num_workers=train_cfg["num_workers"],
+        collate_fn=collate_fn,
+        drop_last=False,
+        pin_memory=True,
+    )
+
+    return eval_dataset, eval_loader

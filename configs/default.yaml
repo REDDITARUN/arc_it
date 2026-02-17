@@ -10,7 +10,7 @@ data:
   num_colors: 12                 # 10 ARC + IGNORE + PAD
   max_grid_size: 30              # Max raw grid dimension
   max_demos: 5                   # Max demonstration pairs per task
-  re_arc_samples_per_task: 25    # Samples generated per RE-ARC task (random K+1 selection)
+  re_arc_samples_per_task: 50    # Samples generated per RE-ARC task (random K+1 selection)
   repeat_factor: 1               # Use natural epochs with on-the-fly augmentation
 
   augmentation:
@@ -57,7 +57,7 @@ training:
   # Three-stage schedule with per-stage data sources
   stage1:
     name: "pretrain"
-    data_sources: ["re_arc", "agi1"]  # RE-ARC + AGI-1 only (no AGI-2)
+    data_sources: ["re_arc"]          # RE-ARC only (covers AGI-1 task concepts with 1000 examples each)
     epochs: 30                   # Bulk pretraining on large synthetic data
     lr: 3.0e-4
 
