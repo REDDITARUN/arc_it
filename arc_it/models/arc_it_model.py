@@ -98,8 +98,6 @@ class ARCITModel(nn.Module):
         decoder_channels: tuple = (512, 256),
         # Input embedder
         input_patch_size: int = 4,
-        # Performance
-        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.sana_hidden = sana_hidden
@@ -142,7 +140,6 @@ class ARCITModel(nn.Module):
             cross_attn_heads=sana_cross_attn_heads,
             mlp_ratio=sana_mlp_ratio,
             num_patches=input_num_patches,
-            gradient_checkpointing=gradient_checkpointing,
         )
 
         # ─── Spatial Decoder ─────────────────────────────────────
@@ -224,8 +221,6 @@ class ARCITModel(nn.Module):
         dec = model_cfg["decoder"]
         data = config["data"]
 
-        train_cfg = config.get("training", {})
-
         return cls(
             encoder_name=enc["name"],
             encoder_dim=enc["embed_dim"],
@@ -241,33 +236,7 @@ class ARCITModel(nn.Module):
             canvas_size=data["canvas_size"],
             num_colors=data["num_colors"],
             decoder_channels=tuple(dec["hidden_channels"]),
-            gradient_checkpointing=train_cfg.get("gradient_checkpointing", False),
         )
-
-    def enable_torch_compile(self, mode: str = "reduce-overhead") -> None:
-        """Compile trainable sub-modules with torch.compile for faster CUDA training.
-
-        Only compiles bridge, input_embedder, sana, and decoder (the trainable
-        parts). The frozen encoder is left uncompiled since it doesn't benefit
-        and compilation overhead isn't worth it for a frozen module.
-
-        Args:
-            mode: Compile mode. "reduce-overhead" is best for fixed-shape inputs
-                  (our case). "max-autotune" is slower to compile but can be
-                  faster at runtime. "default" is the safest fallback.
-        """
-        self.bridge = torch.compile(self.bridge, mode=mode)
-        self.input_embedder = torch.compile(self.input_embedder, mode=mode)
-        self.sana = torch.compile(self.sana, mode=mode)
-        self.decoder = torch.compile(self.decoder, mode=mode)
-
-    def set_gradient_checkpointing(self, enable: bool) -> None:
-        """Toggle gradient checkpointing on Sana backbone.
-
-        Trades ~30% more compute for ~40% less VRAM, allowing larger batch
-        sizes which often more than compensate for the extra compute.
-        """
-        self.sana.gradient_checkpointing = enable
 
     def get_trainable_params(self) -> list:
         """Return only trainable parameters (excludes frozen encoder)."""

@@ -20,18 +20,18 @@ data:
 
 # ─── Model ──────────────────────────────────────────────────────────
 model:
-  # DINOv2 Encoder (FROZEN) — strong discriminative features for visual patterns
+  # I-JEPA Encoder (FROZEN) — predictive spatial features for pattern completion
   encoder:
-    name: "dinov2_vitl14"        # DINOv2 ViT-L/14 pretrained
+    name: "ijepa_vith14_1k"     # I-JEPA ViT-H/14 (ImageNet-1K)
     pretrained: true
     frozen: true
     input_size: 224              # ViT expects 224x224
-    embed_dim: 1024              # DINOv2 ViT-L output dimension
+    embed_dim: 1280              # I-JEPA ViT-H output dimension
     num_patches: 256             # (224/14)^2
 
   # Bridge Module (TRAINABLE)
   bridge:
-    hidden_dim: 2048             # Intermediate expansion
+    hidden_dim: 2560             # Intermediate expansion (2x encoder_dim)
     output_dim: 1152             # Must match Sana hidden_size
     dropout: 0.1
     use_2d_pos_embed: true       # Learnable 16x16 positional embeddings
@@ -59,9 +59,7 @@ training:
   num_workers: 8                 # Mac override: 0
   epochs: 70                     # Total across all stages
   gradient_clip: 1.0
-  gradient_checkpointing: true   # Saves ~40% VRAM, costs ~30% compute (Mac: false)
-  torch_compile: true            # torch.compile on CUDA for fused kernels (Mac: auto-disabled)
-  compile_mode: "reduce-overhead"  # reduce-overhead | max-autotune | default
+  gradient_checkpointing: true   # Mac: false (not needed)
 
   # Three-stage schedule
   stage1:

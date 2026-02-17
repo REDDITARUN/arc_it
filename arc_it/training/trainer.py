@@ -63,43 +63,6 @@ class Trainer:
         self.log_every = train_cfg.get("log_every_n_steps", 100)
         self.save_every = train_cfg.get("save_every_n_epochs", 5)
 
-        # ─── Performance Optimizations ───────────────────────────
-        self._setup_performance(train_cfg)
-
-    def _setup_performance(self, train_cfg: dict) -> None:
-        """Apply CUDA performance optimizations (no-ops on CPU/MPS)."""
-        is_cuda = self.device.type == "cuda"
-
-        # TF32: use Tensor Cores for float32 matmuls on Ampere+ GPUs
-        # ~3x faster matmuls with negligible precision loss
-        if is_cuda:
-            torch.set_float32_matmul_precision("high")
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            print("  TF32 matmul enabled")
-
-        # cuDNN auto-tuner: finds fastest conv algorithms for fixed input sizes
-        if is_cuda:
-            torch.backends.cudnn.benchmark = True
-            print("  cuDNN benchmark enabled")
-
-        # torch.compile: fuse ops, reduce kernel launches, optimize memory
-        compile_enabled = train_cfg.get("torch_compile", is_cuda)
-        if compile_enabled and is_cuda:
-            compile_mode = train_cfg.get("compile_mode", "reduce-overhead")
-            try:
-                self.model.enable_torch_compile(mode=compile_mode)
-                print(f"  torch.compile enabled (mode={compile_mode})")
-                print("  (first few steps will be slow while compiling)")
-            except Exception as e:
-                print(f"  torch.compile failed ({e}), continuing without it")
-
-        # Gradient checkpointing (already set via config -> model init,
-        # but log it here)
-        if train_cfg.get("gradient_checkpointing", False):
-            self.model.set_gradient_checkpointing(True)
-            print("  Gradient checkpointing enabled")
-
     # ─── Public API ──────────────────────────────────────────────
 
     def train(self) -> None:
@@ -288,18 +251,17 @@ class Trainer:
         difficulty_multiplier: float = 1.0,
     ) -> Dict[str, float]:
         """Single training step with AMP and gradient clipping."""
-        nb = self.device.type == "cuda"  # non_blocking for async H2D copies
-        input_rgb = batch["input_rgb_224"].to(self.device, non_blocking=nb)
-        input_canvas = batch["input_canvas"].to(self.device, non_blocking=nb)
-        target = batch["target"].to(self.device, non_blocking=nb)
-        difficulty = batch["difficulty"].to(self.device, non_blocking=nb)
+        input_rgb = batch["input_rgb_224"].to(self.device)
+        input_canvas = batch["input_canvas"].to(self.device)
+        target = batch["target"].to(self.device)
+        difficulty = batch["difficulty"].to(self.device)
 
         # In Stage 3, boost difficulty for hard examples (AGI-2 already has
         # difficulty=1.5 from the dataset; multiplier amplifies that further)
         if difficulty_multiplier != 1.0:
             difficulty = difficulty * difficulty_multiplier
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
 
         amp_device = "cuda" if self.amp_enabled else "cpu"
         with torch.amp.autocast(device_type=amp_device, dtype=self.dtype, enabled=self.amp_enabled):
@@ -342,10 +304,9 @@ class Trainer:
         )
 
         for batch in pbar:
-            nb = self.device.type == "cuda"
-            input_rgb = batch["input_rgb_224"].to(self.device, non_blocking=nb)
-            input_canvas = batch["input_canvas"].to(self.device, non_blocking=nb)
-            target = batch["target"].to(self.device, non_blocking=nb)
+            input_rgb = batch["input_rgb_224"].to(self.device)
+            input_canvas = batch["input_canvas"].to(self.device)
+            target = batch["target"].to(self.device)
 
             result = self.model(input_rgb, input_canvas, target=target)
             metrics = compute_loss(result["logits"], target)
@@ -371,13 +332,10 @@ class Trainer:
     # ─── Checkpointing ───────────────────────────────────────────
 
     def _save_checkpoint(self, filename: str) -> None:
-        """Save model checkpoint (handles compiled models transparently)."""
+        """Save model checkpoint."""
         path = self.checkpoint_dir / filename
-        # torch.compile wraps modules in _orig_mod; state_dict() works fine
-        # but we extract the raw model for clean serialization
-        model_to_save = getattr(self.model, "_orig_mod", self.model)
         torch.save({
-            "model_state_dict": model_to_save.state_dict(),
+            "model_state_dict": self.model.state_dict(),
             "global_step": self.global_step,
             "best_val_acc": self.best_val_acc,
             "config": self.config,
