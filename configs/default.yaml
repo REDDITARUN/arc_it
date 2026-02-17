@@ -23,7 +23,7 @@ data:
 
 # ─── Model ──────────────────────────────────────────────────────────
 model:
-  hidden_size: 384               # Shared hidden dimension (~20M total params)
+  hidden_size: 512               # Scaled up from 384 (~40M total params)
   mlp_ratio: 2.5                 # FFN expansion ratio
 
   # Grid Tokenizer (shared for all grids)
@@ -32,25 +32,25 @@ model:
 
   # Rule Encoder — extracts transformation rule from demo pairs
   rule_encoder:
-    pair_layers: 2               # Per-pair cross-attention layers
-    agg_layers: 2                # Cross-pair aggregation layers
-    num_heads: 8                 # Attention heads (384/8 = 48 dim/head)
-    num_rule_tokens: 64          # Fixed-length rule representation
+    pair_layers: 3               # Per-pair cross-attention layers (was 2)
+    agg_layers: 3                # Cross-pair aggregation layers (was 2)
+    num_heads: 8                 # Attention heads (512/8 = 64 dim/head)
+    num_rule_tokens: 96          # Fixed-length rule representation (was 64)
 
   # Rule Applier — applies rule to test input
   rule_applier:
-    num_layers: 4                # Transformer decoder layers
+    num_layers: 6                # Transformer decoder layers (was 4)
     num_heads: 8                 # Attention heads
 
   # Spatial Decoder (tokens → 64x64 grid logits)
   decoder:
     upsample_method: "transposed_conv"
-    hidden_channels: [192, 96]   # Matched to hidden_size=384
+    hidden_channels: [256, 128]  # Matched to hidden_size=512
 
 # ─── Training ───────────────────────────────────────────────────────
 training:
   # Auto-scaled by device (these are A100/H100 defaults)
-  batch_size: 32                 # Mac override: 4 (task-level = more memory per sample)
+  batch_size: 128                # A100 80GB can handle this at ~40M params
   num_workers: 8                 # Mac override: 0
   gradient_clip: 1.0
 
@@ -58,13 +58,13 @@ training:
   stage1:
     name: "pretrain"
     data_sources: ["re_arc"]          # RE-ARC only (covers AGI-1 task concepts with 1000 examples each)
-    epochs: 30                   # Bulk pretraining on large synthetic data
+    epochs: 50
     lr: 3.0e-4
 
   stage2:
     name: "finetune"
     data_sources: ["agi1", "agi2"]    # Fine-tune on real ARC tasks
-    epochs: 20
+    epochs: 30
     lr: 1.0e-4
 
   stage3:
