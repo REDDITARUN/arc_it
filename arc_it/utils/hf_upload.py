@@ -19,7 +19,6 @@ MODEL_CARD_TEMPLATE = """---
 tags:
   - arc-agi
   - abstract-reasoning
-  - diffusion
   - jepa
   - sana
   - vision-transformer
@@ -31,8 +30,8 @@ license: mit
 A hybrid neural architecture that solves abstract reasoning tasks (ARC-AGI) by combining:
 
 - **JEPA/DINOv2 Encoder (Frozen)** -- Pretrained spatial feature extractor
-- **Bridge Module (Trainable)** -- Maps encoder features to diffusion space
-- **Sana Transformer (Trainable)** -- Linear-attention diffusion backbone
+- **Bridge Module (Trainable)** -- Maps encoder features to transformer space
+- **Sana Transformer (Trainable)** -- Linear-attention conditional transformer
 - **Spatial Decoder (Trainable)** -- Converts transformer output to discrete ARC grids
 
 ## Architecture

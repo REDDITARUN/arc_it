@@ -63,7 +63,7 @@ def main():
             ttt_batch_size=ttt_cfg.get("batch_size", 8),
             num_layers_to_update=ttt_cfg.get("num_layers_to_update", 4),
             num_candidates=ttt_cfg.get("num_candidates", 32),
-            canvas_size=data_cfg["canvas_size"],
+            canvas_size=data_cfg.get("canvas_size", 64),
         )
         results = evaluate_with_ttt(ttt, data_roots, args.split)
     else:

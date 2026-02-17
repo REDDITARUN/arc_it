@@ -13,7 +13,6 @@ import torch.nn as nn
 from arc_it.models.encoder import FrozenEncoder
 from arc_it.models.bridge import Bridge
 from arc_it.models.sana_backbone import (
-    TimestepEmbedder,
     LinearAttention,
     CrossAttention,
     MixFFN,
@@ -21,8 +20,7 @@ from arc_it.models.sana_backbone import (
     SanaBackbone,
 )
 from arc_it.models.decoder import SpatialDecoder
-from arc_it.models.diffusion import DiffusionScheduler
-from arc_it.models.arc_it_model import ARCITModel, OutputEmbedder
+from arc_it.models.arc_it_model import ARCITModel, InputEmbedder
 
 
 B = 2    # batch size for tests
@@ -89,20 +87,6 @@ class TestBridge:
 
 # ─── Sana Component Tests ──────────────────────────────────────────
 
-class TestTimestepEmbedder:
-    def test_shape(self):
-        emb = TimestepEmbedder(C)
-        t = torch.tensor([0, 500, 999])
-        out = emb(t)
-        assert out.shape == (3, C)
-
-    def test_different_timesteps_different_embeddings(self):
-        emb = TimestepEmbedder(C)
-        t = torch.tensor([0, 999])
-        out = emb(t)
-        assert not torch.allclose(out[0], out[1])
-
-
 class TestLinearAttention:
     def test_shape(self):
         attn = LinearAttention(hidden_size=C, num_heads=36, head_dim=32)
@@ -148,16 +132,14 @@ class TestSanaBlock:
         block = SanaBlock(hidden_size=C, self_attn_heads=36, self_attn_head_dim=32)
         x = torch.randn(B, N, C)
         cond = torch.randn(B, N, C)
-        t_emb = torch.randn(B, C)
-        out = block(x, cond, t_emb)
+        out = block(x, cond)
         assert out.shape == (B, N, C)
 
     def test_gradients_flow(self):
         block = SanaBlock(hidden_size=C, self_attn_heads=36, self_attn_head_dim=32)
         x = torch.randn(B, N, C, requires_grad=True)
         cond = torch.randn(B, N, C)
-        t_emb = torch.randn(B, C)
-        out = block(x, cond, t_emb)
+        out = block(x, cond)
         out.sum().backward()
         assert x.grad is not None
 
@@ -168,8 +150,7 @@ class TestSanaBackbone:
         backbone = SanaBackbone(hidden_size=C, depth=2, num_patches=N)
         x = torch.randn(B, N, C)
         cond = torch.randn(B, N, C)
-        t = torch.tensor([0, 500])
-        out = backbone(x, cond, t)
+        out = backbone(x, cond)
         assert out.shape == (B, N, C)
 
     def test_depth_configurable(self):
@@ -203,48 +184,11 @@ class TestSpatialDecoder:
         assert x.grad is not None
 
 
-# ─── Diffusion Tests ────────────────────────────────────────────────
+# ─── Input Embedder Tests ──────────────────────────────────────────
 
-class TestDiffusionScheduler:
-    def test_add_noise(self):
-        sched = DiffusionScheduler(num_train_timesteps=1000)
-        x_0 = torch.randn(B, N, C)
-        noise = torch.randn_like(x_0)
-        t = torch.tensor([0, 999])
-        noisy = sched.add_noise(x_0, noise, t)
-        assert noisy.shape == x_0.shape
-
-    def test_t0_is_mostly_signal(self):
-        sched = DiffusionScheduler(num_train_timesteps=1000)
-        x_0 = torch.ones(1, N, C)
-        noise = torch.zeros(1, N, C)
-        t = torch.tensor([0])
-        noisy = sched.add_noise(x_0, noise, t)
-        # At t=0, should be almost entirely x_0
-        assert torch.allclose(noisy, x_0, atol=0.01)
-
-    def test_t999_is_mostly_noise(self):
-        sched = DiffusionScheduler(num_train_timesteps=1000)
-        x_0 = torch.zeros(1, N, C)
-        noise = torch.ones(1, N, C)
-        t = torch.tensor([999])
-        noisy = sched.add_noise(x_0, noise, t)
-        # At t=999, should be mostly noise
-        assert noisy.abs().mean() > 0.5
-
-    def test_sample_timesteps(self):
-        sched = DiffusionScheduler(num_train_timesteps=1000)
-        t = sched.sample_timesteps(B, torch.device("cpu"))
-        assert t.shape == (B,)
-        assert t.min() >= 0
-        assert t.max() < 1000
-
-
-# ─── Output Embedder Tests ──────────────────────────────────────────
-
-class TestOutputEmbedder:
+class TestInputEmbedder:
     def test_shape(self):
-        emb = OutputEmbedder(num_colors=12, canvas_size=64, hidden_size=C, patch_size=4)
+        emb = InputEmbedder(num_colors=12, canvas_size=64, hidden_size=C, patch_size=4)
         grid = torch.randint(0, 12, (B, 64, 64))
         out = emb(grid)
         expected_patches = (64 // 4) ** 2  # 256
@@ -270,15 +214,13 @@ class TestARCITModel:
             canvas_size=64,
             num_colors=12,
             decoder_channels=(128, 64),
-            num_train_timesteps=100,
-            num_inference_steps=5,
-            output_patch_size=4,
         )
 
     def test_training_forward(self, model):
         input_rgb = torch.randn(B, 3, 224, 224)
+        input_canvas = torch.randint(0, 12, (B, 64, 64))
         target = torch.randint(0, 10, (B, 64, 64))
-        result = model(input_rgb, target=target)
+        result = model(input_rgb, input_canvas, target=target)
         assert "loss" in result
         assert "pixel_accuracy" in result
         assert "logits" in result
@@ -287,16 +229,17 @@ class TestARCITModel:
 
     def test_training_loss_is_finite(self, model):
         input_rgb = torch.randn(B, 3, 224, 224)
+        input_canvas = torch.randint(0, 12, (B, 64, 64))
         target = torch.randint(0, 10, (B, 64, 64))
-        result = model(input_rgb, target=target)
+        result = model(input_rgb, input_canvas, target=target)
         assert torch.isfinite(result["loss"])
 
     def test_training_backward(self, model):
         input_rgb = torch.randn(B, 3, 224, 224)
+        input_canvas = torch.randint(0, 12, (B, 64, 64))
         target = torch.randint(0, 10, (B, 64, 64))
-        result = model(input_rgb, target=target)
+        result = model(input_rgb, input_canvas, target=target)
         result["loss"].backward()
-        # Check that trainable params got gradients
         trainable_params = model.get_trainable_params()
         assert len(trainable_params) > 0
         grads_ok = sum(1 for p in trainable_params if p.grad is not None)
@@ -305,7 +248,8 @@ class TestARCITModel:
     def test_inference_forward(self, model):
         model.eval()
         input_rgb = torch.randn(B, 3, 224, 224)
-        result = model(input_rgb, target=None)
+        input_canvas = torch.randint(0, 12, (B, 64, 64))
+        result = model(input_rgb, input_canvas)
         assert "prediction" in result
         assert "logits" in result
         assert result["prediction"].shape == (B, 64, 64)
@@ -315,22 +259,24 @@ class TestARCITModel:
 
     def test_difficulty_weighting(self, model):
         input_rgb = torch.randn(B, 3, 224, 224)
+        input_canvas = torch.randint(0, 12, (B, 64, 64))
         target = torch.randint(0, 10, (B, 64, 64))
 
         # Without difficulty
-        r1 = model(input_rgb, target=target)
+        r1 = model(input_rgb, input_canvas, target=target)
 
         # With high difficulty weight
         difficulty = torch.tensor([10.0, 10.0])
-        r2 = model(input_rgb, target=target, difficulty=difficulty)
+        r2 = model(input_rgb, input_canvas, target=target, difficulty=difficulty)
 
         # Weighted loss should be higher
         assert r2["loss"] > r1["loss"]
 
     def test_encoder_frozen_after_training_step(self, model):
         input_rgb = torch.randn(B, 3, 224, 224)
+        input_canvas = torch.randint(0, 12, (B, 64, 64))
         target = torch.randint(0, 10, (B, 64, 64))
-        result = model(input_rgb, target=target)
+        result = model(input_rgb, input_canvas, target=target)
         result["loss"].backward()
         for param in model.encoder.parameters():
             assert not param.requires_grad
@@ -356,13 +302,12 @@ class TestARCITModel:
                     "attn_type": "linear", "ffn_type": "glumbconv",
                 },
                 "decoder": {"hidden_channels": [128, 64], "upsample_method": "transposed_conv"},
-                "diffusion": {"num_train_timesteps": 100, "num_inference_steps": 5,
-                              "noise_schedule": "linear", "prediction_type": "epsilon"},
             },
         }
         model = ARCITModel.from_config(config)
         assert model is not None
         input_rgb = torch.randn(1, 3, 224, 224)
+        input_canvas = torch.randint(0, 12, (1, 64, 64))
         target = torch.randint(0, 10, (1, 64, 64))
-        result = model(input_rgb, target=target)
+        result = model(input_rgb, input_canvas, target=target)
         assert torch.isfinite(result["loss"])

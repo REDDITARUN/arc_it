@@ -52,13 +52,6 @@ model:
     upsample_method: "transposed_conv"  # transposed_conv | interpolate
     hidden_channels: [512, 256]         # Channel sizes for upsampling layers
 
-  # Diffusion
-  diffusion:
-    num_train_timesteps: 1000
-    num_inference_steps: 50      # Denoising steps at inference
-    noise_schedule: "linear"     # linear | cosine
-    prediction_type: "x0"        # x0 prediction (not epsilon)
-
 # ─── Training ───────────────────────────────────────────────────────
 training:
   # Auto-scaled by device (these are A100/H100 defaults)

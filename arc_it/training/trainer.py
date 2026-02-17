@@ -130,7 +130,7 @@ class Trainer:
         for param in self.model.sana.parameters():
             param.requires_grad = not freeze_sana
 
-        for module in [self.model.bridge, self.model.output_embedder, self.model.decoder]:
+        for module in [self.model.bridge, self.model.input_embedder, self.model.decoder]:
             for param in module.parameters():
                 param.requires_grad = True
 
@@ -247,6 +247,7 @@ class Trainer:
     ) -> Dict[str, float]:
         """Single training step with AMP and gradient clipping."""
         input_rgb = batch["input_rgb_224"].to(self.device)
+        input_canvas = batch["input_canvas"].to(self.device)
         target = batch["target"].to(self.device)
         difficulty = batch["difficulty"].to(self.device)
 
@@ -254,7 +255,7 @@ class Trainer:
 
         amp_device = "cuda" if self.amp_enabled else "cpu"
         with torch.amp.autocast(device_type=amp_device, dtype=self.dtype, enabled=self.amp_enabled):
-            result = self.model(input_rgb, target=target, difficulty=difficulty)
+            result = self.model(input_rgb, input_canvas, target=target, difficulty=difficulty)
             loss = result["loss"]
 
         self.scaler.scale(loss).backward()
@@ -294,9 +295,10 @@ class Trainer:
 
         for batch in pbar:
             input_rgb = batch["input_rgb_224"].to(self.device)
+            input_canvas = batch["input_canvas"].to(self.device)
             target = batch["target"].to(self.device)
 
-            result = self.model(input_rgb, target=target)
+            result = self.model(input_rgb, input_canvas, target=target)
             metrics = compute_loss(result["logits"], target)
 
             total_loss += metrics["loss"].item()

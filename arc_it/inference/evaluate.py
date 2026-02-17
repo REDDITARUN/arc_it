@@ -65,9 +65,10 @@ class Evaluator:
             t_start = time.time()
 
             input_rgb = batch["input_rgb_224"].to(self.device)
+            input_canvas = batch["input_canvas"].to(self.device)
             target = batch["target"].to(self.device)
 
-            result = self.model(input_rgb, target=None)
+            result = self.model(input_rgb, input_canvas)
             prediction = result["prediction"]
 
             t_elapsed = time.time() - t_start
@@ -129,12 +130,16 @@ class Evaluator:
     def predict_single(
         self,
         input_rgb_224: torch.Tensor,
+        input_canvas: torch.Tensor,
     ) -> torch.Tensor:
         """Predict on a single input grid."""
         if input_rgb_224.dim() == 3:
             input_rgb_224 = input_rgb_224.unsqueeze(0)
+        if input_canvas.dim() == 2:
+            input_canvas = input_canvas.unsqueeze(0)
         input_rgb_224 = input_rgb_224.to(self.device)
-        result = self.model(input_rgb_224, target=None)
+        input_canvas = input_canvas.to(self.device)
+        result = self.model(input_rgb_224, input_canvas)
         return result["prediction"][0].cpu()
 
     def save_results(self, results: Dict[str, Any], path: str) -> None:

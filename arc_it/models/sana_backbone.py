@@ -1,13 +1,12 @@
 """Sana Transformer Backbone for ARC-IT.
 
 Reimplements the core Sana-0.6B architecture (linear attention + cross-attention
-+ Mix-FFN with adaLN conditioning) without depending on the Sana repository.
-This makes the code portable across Mac (dev) and H100 (training).
++ Mix-FFN) as a direct conditional transformer (no diffusion).
 
 Architecture per SanaBlock:
-    1. AdaLN-modulated self-attention (linear attention via LiteLA)
+    1. LayerNorm + self-attention (linear attention via LiteLA)
     2. Cross-attention to encoder conditioning (standard attention)
-    3. AdaLN-modulated Mix-FFN (GLU + depthwise conv)
+    3. LayerNorm + Mix-FFN (GLU + depthwise conv)
 
 Key dimensions (Sana-0.6B):
     hidden_size=1152, depth=28, num_heads=16, linear_head_dim=32, mlp_ratio=2.5
@@ -19,43 +18,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# ─── Timestep Embedding ─────────────────────────────────────────────
-
-class TimestepEmbedder(nn.Module):
-    """Embed scalar diffusion timesteps into vectors.
-
-    Sinusoidal embedding → MLP(hidden → hidden).
-    """
-
-    def __init__(self, hidden_size: int, frequency_dim: int = 256) -> None:
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_dim, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
-        self.frequency_dim = frequency_dim
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            t: (B,) scalar timesteps.
-        Returns:
-            (B, hidden_size) timestep embeddings.
-        """
-        emb = self._sinusoidal_embedding(t, self.frequency_dim)
-        return self.mlp(emb)
-
-    @staticmethod
-    def _sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-        half_dim = dim // 2
-        freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half_dim, device=t.device, dtype=torch.float32) / half_dim
-        )
-        args = t[:, None].float() * freqs[None, :]
-        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
 
 # ─── Linear Attention (LiteLA) ──────────────────────────────────────
@@ -219,10 +181,10 @@ class MixFFN(nn.Module):
 # ─── Sana Block ──────────────────────────────────────────────────────
 
 class SanaBlock(nn.Module):
-    """Single Sana transformer block with adaLN conditioning.
+    """Single Sana transformer block (no diffusion conditioning).
 
-    Flow: adaLN-modulated self-attn → cross-attn → adaLN-modulated FFN
-    Timestep conditioning controls scale/shift/gate via adaLN.
+    Flow: LayerNorm → self-attn → cross-attn → LayerNorm → FFN
+    Standard pre-norm transformer with cross-attention.
     """
 
     def __init__(
@@ -236,7 +198,7 @@ class SanaBlock(nn.Module):
         super().__init__()
 
         # Self-attention (linear)
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
         self.self_attn = LinearAttention(hidden_size, self_attn_heads, self_attn_head_dim)
 
         # Cross-attention
@@ -244,51 +206,29 @@ class SanaBlock(nn.Module):
         self.cross_attn = CrossAttention(hidden_size, cross_attn_heads)
 
         # Mix-FFN
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
         self.ffn = MixFFN(hidden_size, mlp_ratio)
-
-        # adaLN parameters: 6 modulation vectors (shift, scale, gate for attn + ffn)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size),
-        )
-        # Learnable base scale/shift table
-        self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) * 0.02)
 
     def forward(
         self,
         x: torch.Tensor,
         conditioning: torch.Tensor,
-        t_emb: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
             x: (B, N, C) hidden states to transform.
             conditioning: (B, M, C) encoder conditioning for cross-attention.
-            t_emb: (B, C) timestep embedding.
         Returns:
             (B, N, C) transformed hidden states.
         """
-        B = x.shape[0]
+        # 1. Self-attention with pre-norm
+        x = x + self.self_attn(self.norm1(x))
 
-        # Compute adaLN modulation from timestep
-        ada = self.adaLN_modulation(t_emb)  # (B, 6*C)
-        ada = ada.reshape(B, 6, -1)          # (B, 6, C)
-        ada = self.scale_shift_table[None] + ada  # (B, 6, C)
-        shift_sa, scale_sa, gate_sa, shift_ff, scale_ff, gate_ff = ada.unbind(dim=1)
-
-        # 1. Self-attention with adaLN
-        x_norm = self.norm1(x)
-        x_norm = x_norm * (1 + scale_sa.unsqueeze(1)) + shift_sa.unsqueeze(1)
-        x = x + gate_sa.unsqueeze(1) * self.self_attn(x_norm)
-
-        # 2. Cross-attention (no adaLN, simple residual)
+        # 2. Cross-attention (pre-norm on query)
         x = x + self.cross_attn(self.norm_cross(x), conditioning)
 
-        # 3. FFN with adaLN
-        x_norm = self.norm2(x)
-        x_norm = x_norm * (1 + scale_ff.unsqueeze(1)) + shift_ff.unsqueeze(1)
-        x = x + gate_ff.unsqueeze(1) * self.ffn(x_norm)
+        # 3. FFN with pre-norm
+        x = x + self.ffn(self.norm2(x))
 
         return x
 
@@ -296,14 +236,14 @@ class SanaBlock(nn.Module):
 # ─── Full Sana Backbone ─────────────────────────────────────────────
 
 class SanaBackbone(nn.Module):
-    """Stack of Sana transformer blocks with timestep and conditioning inputs.
+    """Stack of Sana transformer blocks as a direct conditional transformer.
 
-    This is the core denoising network. It takes noisy patch embeddings,
-    conditions on encoder features via cross-attention, and produces
-    denoised patch embeddings.
+    No diffusion, no timesteps. Takes input patch embeddings and conditioning,
+    outputs transformed patch embeddings. The cross-attention to encoder
+    features is the sole mechanism for input→output mapping.
 
-    Input:  noisy patches (B, N, C) + conditioning (B, M, C) + timestep (B,)
-    Output: denoised patches (B, N, C)
+    Input:  input patches (B, N, C) + conditioning (B, M, C)
+    Output: output patches (B, N, C)
     """
 
     def __init__(
@@ -320,8 +260,6 @@ class SanaBackbone(nn.Module):
         self.hidden_size = hidden_size
         self.depth = depth
         self.num_patches = num_patches
-
-        self.t_embedder = TimestepEmbedder(hidden_size)
 
         # Learnable positional embeddings for the patch sequence
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size))
@@ -340,37 +278,24 @@ class SanaBackbone(nn.Module):
 
         self.final_norm = nn.LayerNorm(hidden_size)
 
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        """Initialize weights following Sana conventions."""
-        for block in self.blocks:
-            nn.init.zeros_(block.adaLN_modulation[-1].weight)
-            nn.init.zeros_(block.adaLN_modulation[-1].bias)
-
     def forward(
         self,
         x: torch.Tensor,
         conditioning: torch.Tensor,
-        timestep: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
-            x: (B, N, C) noisy patch embeddings.
+            x: (B, N, C) input patch embeddings.
             conditioning: (B, M, C) encoder conditioning.
-            timestep: (B,) diffusion timestep (0 to T-1).
         Returns:
-            (B, N, C) denoised patch embeddings.
+            (B, N, C) output patch embeddings.
         """
         # Add positional embeddings
         x = x + self.pos_embed
 
-        # Embed timestep
-        t_emb = self.t_embedder(timestep)  # (B, C)
-
         # Process through transformer blocks
         for block in self.blocks:
-            x = block(x, conditioning, t_emb)
+            x = block(x, conditioning)
 
         x = self.final_norm(x)
         return x

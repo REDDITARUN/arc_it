@@ -85,9 +85,6 @@ def main():
         canvas_size=64,
         num_colors=12,
         decoder_channels=(128, 64),
-        num_train_timesteps=100,
-        num_inference_steps=5,
-        output_patch_size=4,
     )
     counts = model.param_count()
     print(f"  Total:     {counts['_total']['total'] / 1e6:.1f}M params")
@@ -106,6 +103,7 @@ def main():
         optimizer.zero_grad()
         result = model(
             batch["input_rgb_224"].to(device),
+            batch["input_canvas"].to(device),
             target=batch["target"].to(device),
         )
         result["loss"].backward()
@@ -124,7 +122,10 @@ def main():
     model.eval()
     t_start = time.time()
     with torch.no_grad():
-        result = model(batch["input_rgb_224"][:1].to(device), target=None)
+        result = model(
+            batch["input_rgb_224"][:1].to(device),
+            batch["input_canvas"][:1].to(device),
+        )
     t_infer = time.time() - t_start
 
     prediction = result["prediction"][0]

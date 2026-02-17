@@ -8,7 +8,7 @@ Workflow per task:
     1. Snapshot model weights
     2. Augment demonstration examples (geometric + color perms)
     3. Fine-tune last N Sana layers + Bridge + Decoder for K steps
-    4. Generate predictions (optionally with multi-sample)
+    4. Generate predictions (direct forward pass, no diffusion)
     5. Restore original weights for next task
 """
 
@@ -54,7 +54,6 @@ class TestTimeTrainer:
         ttt_batch_size: int = 8,
         num_layers_to_update: int = 4,
         num_candidates: int = 32,
-        num_denoising_steps: int = 50,
         canvas_size: int = 64,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -64,7 +63,6 @@ class TestTimeTrainer:
         self.ttt_batch_size = ttt_batch_size
         self.num_layers_to_update = num_layers_to_update
         self.num_candidates = num_candidates
-        self.num_denoising_steps = num_denoising_steps
         self.canvas_size = canvas_size
         self.device = device or get_device()
 
@@ -102,6 +100,7 @@ class TestTimeTrainer:
         geos = get_geometric_augmentations()
 
         all_input_rgb = []
+        all_input_canvas = []
         all_targets = []
 
         for example in train_examples:
@@ -133,10 +132,12 @@ class TestTimeTrainer:
 
                 input_rgb = render_canvas_to_rgb_224(input_canvas, normalize=True)
                 all_input_rgb.append(input_rgb)
+                all_input_canvas.append(input_canvas)
                 all_targets.append(target)
 
         return {
             "input_rgb_224": torch.stack(all_input_rgb),
+            "input_canvas": torch.stack(all_input_canvas),
             "target": torch.stack(all_targets),
         }
 
@@ -151,6 +152,7 @@ class TestTimeTrainer:
         optimizer = torch.optim.AdamW(params, lr=self.ttt_lr, weight_decay=0)
 
         input_rgb = train_data["input_rgb_224"].to(self.device)
+        input_canvas = train_data["input_canvas"].to(self.device)
         targets = train_data["target"].to(self.device)
         n_samples = input_rgb.shape[0]
 
@@ -164,10 +166,11 @@ class TestTimeTrainer:
         for step in pbar:
             indices = torch.randint(0, n_samples, (min(self.ttt_batch_size, n_samples),))
             batch_rgb = input_rgb[indices]
+            batch_canvas = input_canvas[indices]
             batch_target = targets[indices]
 
             optimizer.zero_grad()
-            result = self.model(batch_rgb, target=batch_target)
+            result = self.model(batch_rgb, batch_canvas, target=batch_target)
             result["loss"].backward()
             nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
@@ -187,7 +190,7 @@ class TestTimeTrainer:
             param.requires_grad = True
         for param in self.model.decoder.parameters():
             param.requires_grad = True
-        for param in self.model.output_embedder.parameters():
+        for param in self.model.input_embedder.parameters():
             param.requires_grad = True
 
         n_blocks = len(self.model.sana.blocks)
@@ -204,14 +207,15 @@ class TestTimeTrainer:
         input_grid: List[List[int]],
         num_candidates: int = 32,
     ) -> List[List[List[int]]]:
-        """Generate multiple candidate predictions."""
-        self.model.eval()
+        """Generate multiple candidate predictions via augmentation voting.
 
-        input_canvas, _, _, _ = pad_grid_to_canvas(
-            input_grid, self.canvas_size, x_offset=1, y_offset=1, mark_boundary=False
-        )
-        input_rgb = render_canvas_to_rgb_224(input_canvas, normalize=True)
-        input_rgb = input_rgb.unsqueeze(0).to(self.device)
+        Since there's no stochastic diffusion, we generate diversity by
+        applying geometric augmentations to the input, predicting, and
+        then inverting the augmentation on the output.
+        """
+        self.model.eval()
+        rng = np.random.RandomState(123)
+        geos = get_geometric_augmentations()
 
         candidates = []
         pbar = tqdm(
@@ -220,10 +224,41 @@ class TestTimeTrainer:
             leave=False,
             dynamic_ncols=True,
         )
-        for _ in pbar:
-            result = self.model(input_rgb, target=None)
+        for i in pbar:
+            # Pick a random geometric augmentation
+            geo_name, geo_fn = geos[i % len(geos)]
+            inv_fn = get_inverse_geometric(geo_name)
+
+            # Optionally apply color permutation for more diversity
+            if i >= len(geos):
+                color_perm = random_color_permutation(rng, keep_background=True)
+                inv_color_perm = inverse_color_permutation(color_perm)
+            else:
+                color_perm = None
+                inv_color_perm = None
+
+            # Augment input
+            aug_input = geo_fn(input_grid)
+            if color_perm is not None:
+                aug_input = permute_colors(aug_input, color_perm)
+
+            # Embed and predict
+            input_canvas, _, _, _ = pad_grid_to_canvas(
+                aug_input, self.canvas_size, x_offset=1, y_offset=1, mark_boundary=False
+            )
+            input_rgb = render_canvas_to_rgb_224(input_canvas, normalize=True)
+            input_rgb = input_rgb.unsqueeze(0).to(self.device)
+            input_canvas_t = input_canvas.unsqueeze(0).to(self.device)
+
+            result = self.model(input_rgb, input_canvas_t)
             pred = result["prediction"][0].cpu()
             grid = crop_prediction_from_canvas(pred, x_offset=1, y_offset=1)
+
+            # Invert augmentations
+            if inv_color_perm is not None:
+                grid = permute_colors(grid, inv_color_perm)
+            grid = inv_fn(grid)
+
             candidates.append(grid)
         pbar.close()
 
@@ -235,23 +270,24 @@ class TestTimeTrainer:
         self,
         candidates: List[List[List[int]]],
     ) -> List[List[List[int]]]:
-        """Score and rank candidates using heuristics."""
-        scored = []
+        """Score and rank candidates by frequency (majority voting)."""
+        # Count how often each unique prediction appears
+        counts = {}
         for grid in candidates:
-            score = self._compute_grid_score(grid)
-            scored.append((score, grid))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        seen = set()
-        unique = []
-        for score, grid in scored:
             key = str(grid)
-            if key not in seen:
-                seen.add(key)
-                unique.append(grid)
+            if key not in counts:
+                counts[key] = {"grid": grid, "count": 0, "score": 0.0}
+            counts[key]["count"] += 1
 
-        return unique
+        # Score = frequency + heuristic quality
+        for key, info in counts.items():
+            freq_score = info["count"] / len(candidates)
+            quality_score = self._compute_grid_score(info["grid"])
+            info["score"] = 0.7 * freq_score + 0.3 * quality_score
+
+        # Sort by score (frequency-weighted)
+        ranked = sorted(counts.values(), key=lambda x: x["score"], reverse=True)
+        return [item["grid"] for item in ranked]
 
     @staticmethod
     def _compute_grid_score(grid: List[List[int]]) -> float:

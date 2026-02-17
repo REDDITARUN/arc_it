@@ -36,9 +36,6 @@ def small_model():
         canvas_size=64,
         num_colors=12,
         decoder_channels=(64, 32),
-        num_train_timesteps=50,
-        num_inference_steps=3,
-        output_patch_size=4,
     )
 
 
@@ -133,7 +130,8 @@ class TestEvaluator:
     def test_predict_single(self, small_model):
         evaluator = Evaluator(small_model, device=torch.device("cpu"))
         input_rgb = torch.randn(3, 224, 224)
-        pred = evaluator.predict_single(input_rgb)
+        input_canvas = torch.randint(0, 12, (64, 64))
+        pred = evaluator.predict_single(input_rgb, input_canvas)
         assert pred.shape == (64, 64)
         assert pred.min() >= 0
         assert pred.max() < 12
@@ -185,11 +183,14 @@ class TestTTT:
         )
         data = ttt._prepare_ttt_data(sample_task["train"])
         assert "input_rgb_224" in data
+        assert "input_canvas" in data
         assert "target" in data
         # 2 examples * 8 geometric augmentations = 16 samples
         assert data["input_rgb_224"].shape[0] == 16
+        assert data["input_canvas"].shape[0] == 16
         assert data["target"].shape[0] == 16
         assert data["input_rgb_224"].shape[1:] == (3, 224, 224)
+        assert data["input_canvas"].shape[1:] == (64, 64)
         assert data["target"].shape[1:] == (64, 64)
 
     def test_candidate_scoring(self, small_model):
@@ -225,7 +226,11 @@ class TestTrainEvalCycle:
         batch = next(iter(loader))
         for _ in range(3):
             optimizer.zero_grad()
-            result = small_model(batch["input_rgb_224"], target=batch["target"])
+            result = small_model(
+                batch["input_rgb_224"],
+                batch["input_canvas"],
+                target=batch["target"],
+            )
             result["loss"].backward()
             optimizer.step()
 
