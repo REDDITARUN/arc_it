@@ -18,6 +18,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # ─── Linear Attention (LiteLA) ──────────────────────────────────────
@@ -255,11 +256,13 @@ class SanaBackbone(nn.Module):
         cross_attn_heads: int = 16,
         mlp_ratio: float = 2.5,
         num_patches: int = 256,
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.depth = depth
         self.num_patches = num_patches
+        self.gradient_checkpointing = gradient_checkpointing
 
         # Learnable positional embeddings for the patch sequence
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size))
@@ -295,7 +298,10 @@ class SanaBackbone(nn.Module):
 
         # Process through transformer blocks
         for block in self.blocks:
-            x = block(x, conditioning)
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(block, x, conditioning, use_reentrant=False)
+            else:
+                x = block(x, conditioning)
 
         x = self.final_norm(x)
         return x

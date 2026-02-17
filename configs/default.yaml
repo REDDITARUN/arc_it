@@ -59,7 +59,9 @@ training:
   num_workers: 8                 # Mac override: 0
   epochs: 70                     # Total across all stages
   gradient_clip: 1.0
-  gradient_checkpointing: true   # Mac: false (not needed)
+  gradient_checkpointing: true   # Saves ~40% VRAM, costs ~30% compute (Mac: false)
+  torch_compile: true            # torch.compile on CUDA for fused kernels (Mac: auto-disabled)
+  compile_mode: "reduce-overhead"  # reduce-overhead | max-autotune | default
 
   # Three-stage schedule
   stage1:
