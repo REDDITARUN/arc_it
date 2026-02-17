@@ -50,7 +50,7 @@ model:
 # ─── Training ───────────────────────────────────────────────────────
 training:
   # Auto-scaled by device (these are A100/H100 defaults)
-  batch_size: 128                # A100 80GB can handle this at ~40M params
+  batch_size: 96                  # A100 80GB with 43M params + 256 tokens × 5 demos
   num_workers: 8                 # Mac override: 0
   gradient_clip: 1.0
 
