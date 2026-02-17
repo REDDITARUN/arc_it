@@ -1,11 +1,11 @@
 """ARC-IT: Full integrated model combining all components.
 
 Architecture:
-    Input Grid → [Render RGB 224] → FrozenEncoder(I-JEPA) → Bridge → conditioning
+    Input Grid → [Render RGB 224] → FrozenEncoder(DINOv2) → Bridge → conditioning
     Output Grid → [ColorEmbed + PatchEmbed + Noise] → SanaBackbone → SpatialDecoder → logits
 
 Training:
-    1. Encode input grid with frozen I-JEPA → spatial features
+    1. Encode input grid with frozen DINOv2 → spatial features
     2. Bridge maps features to Sana conditioning space
     3. Embed + noise the output grid (diffusion forward process)
     4. Sana denoises conditioned on encoder features (x_0 prediction)
@@ -69,7 +69,7 @@ class OutputEmbedder(nn.Module):
 class ARCITModel(nn.Module):
     """Full ARC-IT hybrid model.
 
-    Combines frozen I-JEPA encoder + bridge + Sana diffusion transformer + spatial decoder.
+    Combines frozen DINOv2 encoder + bridge + Sana diffusion transformer + spatial decoder.
     """
 
     def __init__(
@@ -204,7 +204,8 @@ class ARCITModel(nn.Module):
         denoised = self.sana(noisy_embed, conditioning, timesteps)
         logits = self.decoder(denoised)
 
-        loss = F.cross_entropy(
+        valid_mask = (target != IGNORE_INDEX)
+        ce = F.cross_entropy(
             logits,
             target.long(),
             ignore_index=IGNORE_INDEX,
@@ -212,15 +213,16 @@ class ARCITModel(nn.Module):
         )
 
         if difficulty is not None:
-            loss = loss * difficulty[:, None, None]
-        loss = loss.mean()
+            ce = ce * difficulty[:, None, None]
+
+        # Normalize by valid pixel count only (not total canvas area)
+        valid_pixels = valid_mask.sum().clamp(min=1)
+        loss = ce.sum() / valid_pixels.float()
 
         with torch.no_grad():
             pred = logits.argmax(dim=1)
-            valid_mask = target != IGNORE_INDEX
             correct = ((pred == target) & valid_mask).sum()
-            total = valid_mask.sum()
-            pixel_acc = correct.float() / total.float().clamp(min=1)
+            pixel_acc = correct.float() / valid_pixels.float()
 
         return {
             "loss": loss,

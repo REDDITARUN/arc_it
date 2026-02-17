@@ -86,7 +86,11 @@ def permute_colors(
               e.g., [0, 3, 1, 2, 4, 5, 6, 7, 8, 9] swaps colors 1<->3, 2->1, 3->2.
     """
     arr = np.array(grid)
-    perm_extended = np.array(perm + list(range(10, arr.max() + 1)) if arr.max() >= 10 else perm)
+    max_val = int(arr.max()) if arr.size > 0 else 0
+    if max_val >= 10:
+        perm_extended = np.array(perm + list(range(10, max_val + 1)))
+    else:
+        perm_extended = np.array(perm)
     return perm_extended[arr].tolist()
 
 

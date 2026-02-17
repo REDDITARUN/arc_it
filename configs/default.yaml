@@ -8,7 +8,7 @@ data:
   canvas_size: 64                # Fixed canvas for all grids (VARC-proven)
   num_colors: 12                 # 10 ARC + IGNORE + PAD
   max_grid_size: 30              # Max raw grid dimension
-  repeat_factor: 16              # Multiply dataset size (on-the-fly augmentation makes each unique)
+  repeat_factor: 1               # Use natural epochs with on-the-fly augmentation (VARC-style)
 
   augmentation:
     geometric: true              # 8 variants (rotations + flips + transpose)
@@ -20,13 +20,13 @@ data:
 
 # ─── Model ──────────────────────────────────────────────────────────
 model:
-  # I-JEPA Encoder (FROZEN) — better for spatial/abstract reasoning than DINOv2
+  # DINOv2 Encoder (FROZEN) — strong discriminative features for visual patterns
   encoder:
-    name: "ijepa_vith14_1k"      # I-JEPA ViT-H/14 trained on ImageNet-1K
+    name: "dinov2_vitl14"        # DINOv2 ViT-L/14 pretrained
     pretrained: true
     frozen: true
     input_size: 224              # ViT expects 224x224
-    embed_dim: 1280              # ViT-H output embedding dimension
+    embed_dim: 1024              # DINOv2 ViT-L output dimension
     num_patches: 256             # (224/14)^2
 
   # Bridge Module (TRAINABLE)
@@ -45,7 +45,7 @@ model:
     mlp_ratio: 2.5               # FFN expansion ratio
     attn_type: "linear"          # linear | flash
     ffn_type: "glumbconv"        # glumbconv | mlp
-    pretrained: true             # Load Sana-0.6B pretrained weights
+    pretrained: false            # Train Sana from random init (pretrained was text-to-image, hurts ARC)
 
   # Spatial Decoder (TRAINABLE)
   decoder:
@@ -61,29 +61,29 @@ model:
 
 # ─── Training ───────────────────────────────────────────────────────
 training:
-  # Auto-scaled by device (these are H100 defaults)
+  # Auto-scaled by device (these are A100/H100 defaults)
   batch_size: 64                 # Mac override: 4
   num_workers: 8                 # Mac override: 0
-  epochs: 30
+  epochs: 70                     # Total across all stages
   gradient_clip: 1.0
   gradient_checkpointing: true   # Mac: false (not needed)
 
   # Three-stage schedule
   stage1:
     name: "bridge_alignment"
-    epochs: 5
-    lr: 1.0e-4
+    epochs: 10
+    lr: 2.0e-4                   # Higher LR for fresh bridge weights
     freeze_sana: true
 
   stage2:
     name: "full_training"
-    epochs: 20
-    lr: 5.0e-5
+    epochs: 50                   # Much longer to converge (VARC uses 100 total)
+    lr: 1.0e-4                   # Higher initial LR, cosine will decay
     freeze_sana: false
 
   stage3:
     name: "hard_focus"
-    epochs: 5
+    epochs: 10
     lr: 1.0e-5
     freeze_sana: false
     agi2_oversample: 2.0         # 2x weight on AGI-2 tasks
@@ -99,7 +99,7 @@ training:
 
   # Logging & Checkpointing
   log_every_n_steps: 100
-  save_every_n_epochs: 5         # Save checkpoints less frequently
+  save_every_n_epochs: 10        # Save periodic checkpoints every 10 epochs
   checkpoint_dir: "checkpoints"
 
 # ─── Test-Time Training ─────────────────────────────────────────────

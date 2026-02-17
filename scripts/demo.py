@@ -74,7 +74,7 @@ def main():
     print("\n[3/6] Building model (stub encoder for demo)...")
     model = ARCITModel(
         encoder_name="stub",
-        encoder_dim=1280,
+        encoder_dim=1024,
         encoder_pretrained=False,
         sana_hidden=256,
         sana_depth=2,

@@ -34,6 +34,7 @@ def compute_loss(
     B = logits.shape[0]
 
     # Per-pixel cross-entropy (unreduced)
+    valid = target != IGNORE_INDEX  # (B, H, W)
     ce = F.cross_entropy(
         logits, target.long(),
         ignore_index=IGNORE_INDEX,
@@ -44,17 +45,17 @@ def compute_loss(
     if difficulty is not None:
         ce = ce * difficulty[:, None, None]
 
-    loss = ce.mean()
+    # Normalize by valid pixel count only (not total canvas area)
+    valid_pixels = valid.sum().clamp(min=1)
+    loss = ce.sum() / valid_pixels.float()
 
     # ─── Metrics ─────────────────────────────────────────────────
     with torch.no_grad():
         pred = logits.argmax(dim=1)  # (B, H, W)
-        valid = target != IGNORE_INDEX  # (B, H, W)
 
-        # Pixel accuracy
+        # Pixel accuracy (reuse `valid` mask from above)
         correct_pixels = ((pred == target) & valid).sum()
-        total_pixels = valid.sum().clamp(min=1)
-        pixel_acc = correct_pixels.float() / total_pixels.float()
+        pixel_acc = correct_pixels.float() / valid_pixels.float()
 
         # Grid exact match: a grid is correct only if ALL valid pixels match
         per_grid_correct = ((pred == target) | ~valid).all(dim=-1).all(dim=-1)  # (B,)

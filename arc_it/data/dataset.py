@@ -315,7 +315,7 @@ def build_dataloaders(
     if eval_cfg:
         eval_dataset = ARCDataset(
             data_roots=data_roots,
-            split="evaluation",
+            split="training",
             subset="test",
             canvas_size=canvas_size,
             enable_augmentation=False,

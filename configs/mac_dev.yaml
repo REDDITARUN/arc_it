@@ -23,7 +23,7 @@ training:
 model:
   encoder:
     name: "stub"                 # Use stub encoder for fast local dev
-    embed_dim: 1280
+    embed_dim: 1024              # Match DINOv2 ViT-L dim
   sana:
     pretrained: false             # Skip loading large checkpoint for dev
 
