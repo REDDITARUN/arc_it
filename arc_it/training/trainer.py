@@ -1,11 +1,14 @@
-"""Two-stage Trainer for ARC-IT Rule-Conditioned Transformer.
+"""Three-stage Trainer for ARC-IT Rule-Conditioned Transformer.
 
-Stage 1 (Full Training):  Train all components with cosine LR schedule.
-Stage 2 (Hard Focus):     Lower LR, oversample AGI-2 tasks.
+Stage 1 (Pretrain):    RE-ARC + AGI-1 — bulk pretraining on synthetic data.
+Stage 2 (Finetune):    AGI-1 + AGI-2  — fine-tune on real ARC tasks.
+Stage 3 (Hard Focus):  AGI-1 + AGI-2  — lower LR, oversample AGI-2.
 
-All ~20M parameters are trainable from the start (no frozen encoder).
+Each stage builds its own dataloaders based on config data_sources.
+Validation always runs on AGI-1 + AGI-2 test split.
 
 Features:
+    - Per-stage data source selection
     - tqdm progress bars for training and validation
     - Automatic mixed precision (AMP) on CUDA
     - Gradient clipping
@@ -16,7 +19,7 @@ Features:
 
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -25,18 +28,17 @@ from tqdm import tqdm
 
 from arc_it.models.arc_it_model import ARCITModel
 from arc_it.training.loss import compute_loss
+from arc_it.data.dataset import build_dataloaders
 from arc_it.utils.device import get_device, get_dtype, get_amp_enabled
 
 
 class Trainer:
-    """Manages the training process for the Rule-Conditioned Transformer."""
+    """Manages the multi-stage training process."""
 
     def __init__(
         self,
         model: ARCITModel,
-        train_loader: DataLoader,
-        val_loader: Optional[DataLoader] = None,
-        config: Optional[Dict[str, Any]] = None,
+        config: Dict[str, Any],
         checkpoint_dir: str = "checkpoints",
         use_wandb: bool = False,
     ) -> None:
@@ -45,9 +47,7 @@ class Trainer:
         self.amp_enabled = get_amp_enabled(self.device)
 
         self.model = model.to(self.device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.config = config or {}
+        self.config = config
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -64,52 +64,110 @@ class Trainer:
         self.log_every = train_cfg.get("log_every_n_steps", 100)
         self.save_every = train_cfg.get("save_every_n_epochs", 5)
 
+        # Build val loader once (always on real ARC)
+        self.val_loader = None
+        self._build_val_loader()
+
     # ─── Public API ──────────────────────────────────────────────
 
     def train(self) -> None:
-        """Run the full training pipeline."""
+        """Run the full 3-stage training pipeline."""
         if self.use_wandb:
             self._init_wandb()
 
         train_cfg = self.config.get("training", {})
 
-        # Stage 1: Full Training
+        # Stage 1: Pretrain on RE-ARC + AGI-1
         s1 = train_cfg.get("stage1", {})
-        print("\n" + "=" * 60)
-        print("STAGE 1: Full Training")
-        print("=" * 60)
+        s1_sources = s1.get("data_sources", ["re_arc", "agi1"])
+        print(f"\n{'='*60}")
+        print(f"STAGE 1: {s1.get('name', 'Pretrain')}")
+        print(f"{'='*60}")
+        print(f"  Data sources: {s1_sources}")
         self._print_trainable_info()
+        train_loader = self._build_train_loader(s1_sources)
         optimizer, scheduler = self._build_optimizer(
-            lr=s1.get("lr", 1e-4),
-            epochs=s1.get("epochs", 50),
+            lr=s1.get("lr", 3e-4),
+            epochs=s1.get("epochs", 30),
+            steps_per_epoch=len(train_loader),
         )
         self._train_epochs(
-            optimizer, scheduler,
-            epochs=s1.get("epochs", 50),
+            train_loader, optimizer, scheduler,
+            epochs=s1.get("epochs", 30),
             stage_name="stage1",
         )
 
-        # Stage 2: Hard Focus (boost AGI-2 difficulty weight)
+        # Stage 2: Fine-tune on AGI-1 + AGI-2
         s2 = train_cfg.get("stage2", {})
-        print("\n" + "=" * 60)
-        print("STAGE 2: Hard Example Focus")
-        print("=" * 60)
-        agi2_weight = s2.get("agi2_oversample", 2.0)
-        print(f"  AGI-2 difficulty multiplier: {agi2_weight}x")
+        s2_sources = s2.get("data_sources", ["agi1", "agi2"])
+        print(f"\n{'='*60}")
+        print(f"STAGE 2: {s2.get('name', 'Finetune')}")
+        print(f"{'='*60}")
+        print(f"  Data sources: {s2_sources}")
+        self._print_trainable_info()
+        train_loader = self._build_train_loader(s2_sources)
         optimizer, scheduler = self._build_optimizer(
-            lr=s2.get("lr", 1e-5),
-            epochs=s2.get("epochs", 10),
+            lr=s2.get("lr", 1e-4),
+            epochs=s2.get("epochs", 20),
+            steps_per_epoch=len(train_loader),
         )
         self._train_epochs(
-            optimizer, scheduler,
-            epochs=s2.get("epochs", 10),
+            train_loader, optimizer, scheduler,
+            epochs=s2.get("epochs", 20),
             stage_name="stage2",
+        )
+
+        # Stage 3: Hard Focus (AGI-2 oversampling)
+        s3 = train_cfg.get("stage3", {})
+        s3_sources = s3.get("data_sources", ["agi1", "agi2"])
+        agi2_weight = s3.get("agi2_oversample", 2.0)
+        print(f"\n{'='*60}")
+        print(f"STAGE 3: {s3.get('name', 'Hard Focus')}")
+        print(f"{'='*60}")
+        print(f"  Data sources: {s3_sources}")
+        print(f"  AGI-2 difficulty multiplier: {agi2_weight}x")
+        self._print_trainable_info()
+        train_loader = self._build_train_loader(s3_sources)
+        optimizer, scheduler = self._build_optimizer(
+            lr=s3.get("lr", 3e-5),
+            epochs=s3.get("epochs", 10),
+            steps_per_epoch=len(train_loader),
+        )
+        self._train_epochs(
+            train_loader, optimizer, scheduler,
+            epochs=s3.get("epochs", 10),
+            stage_name="stage3",
             difficulty_multiplier=agi2_weight,
         )
 
         print("\nTraining complete!")
         if self.wandb_run:
             self.wandb_run.finish()
+
+    # ─── Dataloader builders ─────────────────────────────────────
+
+    def _build_train_loader(self, data_sources: List[str]) -> DataLoader:
+        """Build a training DataLoader for the given data sources."""
+        train_ds, train_loader, _, _ = build_dataloaders(
+            self.config, data_sources=data_sources
+        )
+        print(f"  Train: {len(train_ds)} samples, {train_ds.num_tasks} tasks")
+        return train_loader
+
+    def _build_val_loader(self) -> None:
+        """Build validation DataLoader (always on real ARC data)."""
+        eval_cfg = self.config.get("evaluation", {})
+        val_sources = eval_cfg.get("val_data_sources", ["agi1", "agi2"])
+        try:
+            _, _, val_ds, val_loader = build_dataloaders(
+                self.config, data_sources=val_sources
+            )
+            self.val_loader = val_loader
+            if val_ds:
+                print(f"  Val: {len(val_ds)} samples")
+        except (RuntimeError, FileNotFoundError):
+            print("  Warning: Could not build val loader, skipping validation.")
+            self.val_loader = None
 
     # ─── Info ────────────────────────────────────────────────────
 
@@ -121,7 +179,9 @@ class Trainer:
 
     # ─── Optimizer ───────────────────────────────────────────────
 
-    def _build_optimizer(self, lr: float, epochs: int) -> tuple:
+    def _build_optimizer(
+        self, lr: float, epochs: int, steps_per_epoch: int
+    ) -> tuple:
         """Build AdamW optimizer and cosine scheduler."""
         opt_cfg = self.config.get("training", {}).get("optimizer", {})
         sched_cfg = self.config.get("training", {}).get("scheduler", {})
@@ -134,7 +194,7 @@ class Trainer:
             betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
         )
 
-        total_steps = epochs * len(self.train_loader)
+        total_steps = epochs * steps_per_epoch
         warmup_steps = int(total_steps * sched_cfg.get("warmup_ratio", 0.1))
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -151,6 +211,7 @@ class Trainer:
 
     def _train_epochs(
         self,
+        train_loader: DataLoader,
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler._LRScheduler,
         epochs: int,
@@ -165,7 +226,7 @@ class Trainer:
             epoch_steps = 0
 
             pbar = tqdm(
-                self.train_loader,
+                train_loader,
                 desc=f"  {stage_name} epoch {epoch+1}/{epochs}",
                 leave=True,
                 dynamic_ncols=True,

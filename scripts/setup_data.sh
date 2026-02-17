@@ -1,5 +1,5 @@
 #!/bin/bash
-# Download ARC-AGI datasets into References/
+# Download ARC-AGI datasets and RE-ARC into References/
 # Run this once on any new machine before training.
 #
 # Usage:
@@ -39,18 +39,59 @@ else
     echo "[OK] ARC-AGI-2 downloaded"
 fi
 
+# RE-ARC (400 task concepts × 1000 generated examples each)
+if [ -d "RE-ARC/tasks" ]; then
+    echo "[OK] RE-ARC already present"
+else
+    echo "[>>] Downloading RE-ARC..."
+    git clone --depth 1 https://github.com/michaelhodel/re-arc.git re-arc-repo
+    mkdir -p RE-ARC
+    cd re-arc-repo
+
+    # Extract the pre-generated dataset from the zip
+    if [ -f "re_arc.zip" ]; then
+        echo "  Extracting re_arc.zip..."
+        unzip -q re_arc.zip -d ../RE-ARC-tmp
+        # Move tasks/ to the right place
+        if [ -d "../RE-ARC-tmp/re_arc/tasks" ]; then
+            mv ../RE-ARC-tmp/re_arc/tasks ../RE-ARC/tasks
+        elif [ -d "../RE-ARC-tmp/tasks" ]; then
+            mv ../RE-ARC-tmp/tasks ../RE-ARC/tasks
+        fi
+        rm -rf ../RE-ARC-tmp
+    else
+        echo "  Warning: re_arc.zip not found, generating dataset..."
+        echo "  This requires Python and may take a while."
+        python main.py 2>/dev/null || echo "  Generation failed, install deps first."
+        if [ -d "re_arc/tasks" ]; then
+            mv re_arc/tasks ../RE-ARC/tasks
+        fi
+    fi
+
+    cd "$REF_DIR"
+    rm -rf re-arc-repo
+    echo "[OK] RE-ARC downloaded"
+fi
+
 # Verify
 echo ""
 echo "Verifying datasets..."
 AGI1_COUNT=$(ls "$REF_DIR/ARC-AGI/data/training/"*.json 2>/dev/null | wc -l | tr -d ' ')
 AGI2_COUNT=$(ls "$REF_DIR/ARC-AGI-2/data/training/"*.json 2>/dev/null | wc -l | tr -d ' ')
+REARC_COUNT=$(ls "$REF_DIR/RE-ARC/tasks/"*.json 2>/dev/null | wc -l | tr -d ' ')
 echo "  ARC-AGI-1 training tasks: $AGI1_COUNT"
 echo "  ARC-AGI-2 training tasks: $AGI2_COUNT"
+echo "  RE-ARC task concepts:     $REARC_COUNT"
 
 if [ "$AGI1_COUNT" -gt 0 ] && [ "$AGI2_COUNT" -gt 0 ]; then
     echo ""
     echo "Setup complete! You can now run:"
     echo "  python scripts/train.py --wandb"
+    if [ "$REARC_COUNT" -eq 0 ]; then
+        echo ""
+        echo "  Note: RE-ARC not available. Stage 1 will fall back to AGI-1 only."
+        echo "  To add RE-ARC manually, place task JSONs in References/RE-ARC/tasks/"
+    fi
 else
     echo ""
     echo "WARNING: Some datasets may be missing. Check the output above."

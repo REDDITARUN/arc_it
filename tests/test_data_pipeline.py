@@ -316,3 +316,105 @@ class TestDatasetIntegration:
         target = sample["target"]
         ignore_count = (target == IGNORE_INDEX).sum().item()
         assert ignore_count > 64 * 64 - 20
+
+
+# ─── RE-ARC Dataset Tests ─────────────────────────────────────────
+
+class TestREARCDataset:
+    @pytest.fixture
+    def re_arc_dir(self):
+        """Create a temporary RE-ARC directory with flat-list format."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tasks_dir = Path(tmpdir) / "tasks"
+            tasks_dir.mkdir()
+
+            for i in range(3):
+                examples = [
+                    {"input": [[j, j+1], [j+2, j+3]],
+                     "output": [[j+3, j+2], [j+1, j]]}
+                    for j in range(10)
+                ]
+                with open(tasks_dir / f"task_{i:03d}.json", "w") as f:
+                    json.dump(examples, f)
+
+            yield tmpdir
+
+    def test_re_arc_loads(self, re_arc_dir):
+        from arc_it.data.dataset import ARCTaskDataset
+        ds = ARCTaskDataset(
+            data_roots=[re_arc_dir],
+            split="training",
+            subset="train",
+            canvas_size=64,
+            max_demos=5,
+            enable_augmentation=False,
+            enable_translation=False,
+            enable_resolution=False,
+            re_arc_samples_per_task=5,
+        )
+        assert ds.num_tasks == 3
+        assert len(ds) == 15  # 3 tasks × 5 samples each
+
+    def test_re_arc_sample_shape(self, re_arc_dir):
+        from arc_it.data.dataset import ARCTaskDataset
+        ds = ARCTaskDataset(
+            data_roots=[re_arc_dir],
+            split="training",
+            subset="train",
+            canvas_size=64,
+            max_demos=5,
+            enable_augmentation=False,
+            enable_translation=False,
+            enable_resolution=False,
+            re_arc_samples_per_task=3,
+        )
+        sample = ds[0]
+        assert sample["demo_inputs"].shape == (5, 64, 64)
+        assert sample["demo_outputs"].shape == (5, 64, 64)
+        assert sample["query_input"].shape == (64, 64)
+        assert sample["target"].shape == (64, 64)
+        assert sample["num_demos"].item() >= 1
+
+    def test_re_arc_mixed_with_agi(self, re_arc_dir, arc_data_dir):
+        from arc_it.data.dataset import ARCTaskDataset
+        ds = ARCTaskDataset(
+            data_roots=[re_arc_dir, arc_data_dir],
+            split="training",
+            subset="train",
+            canvas_size=64,
+            max_demos=5,
+            enable_augmentation=False,
+            enable_translation=False,
+            enable_resolution=False,
+            re_arc_samples_per_task=5,
+        )
+        # 3 RE-ARC tasks × 5 + 2 AGI tasks × 3 (leave-one-out)
+        assert ds.num_tasks == 5
+        assert len(ds) == 15 + 6
+
+    def test_re_arc_ignored_for_eval(self, re_arc_dir):
+        """RE-ARC should be skipped for evaluation subset."""
+        from arc_it.data.dataset import ARCTaskDataset
+        with pytest.raises(RuntimeError, match="No samples found"):
+            ARCTaskDataset(
+                data_roots=[re_arc_dir],
+                split="training",
+                subset="test",
+                canvas_size=64,
+                max_demos=5,
+                enable_augmentation=False,
+            )
+
+    def test_re_arc_task_name_prefix(self, re_arc_dir):
+        from arc_it.data.dataset import ARCTaskDataset
+        ds = ARCTaskDataset(
+            data_roots=[re_arc_dir],
+            split="training",
+            subset="train",
+            canvas_size=64,
+            max_demos=5,
+            enable_augmentation=False,
+            re_arc_samples_per_task=2,
+        )
+        sample = ds[0]
+        assert sample["task_name"].startswith("re_arc_")

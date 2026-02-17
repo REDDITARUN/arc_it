@@ -30,7 +30,6 @@ load_dotenv()
 import torch
 from arc_it.utils.config import load_config
 from arc_it.utils.device import device_info
-from arc_it.data.dataset import build_dataloaders
 from arc_it.models.arc_it_model import ARCITModel
 from arc_it.training.trainer import Trainer
 
@@ -58,14 +57,6 @@ def main():
     print(f"Batch size: {config['training']['batch_size']}")
     print()
 
-    # ─── Data ────────────────────────────────────────────────────
-    print("Loading datasets...")
-    train_ds, train_loader, val_ds, val_loader = build_dataloaders(config)
-    print(f"Train: {len(train_ds)} samples, {train_ds.num_tasks} tasks")
-    if val_ds:
-        print(f"Val:   {len(val_ds)} samples")
-    print()
-
     # ─── Model ───────────────────────────────────────────────────
     print("Building model...")
     model = ARCITModel.from_config(config)
@@ -77,13 +68,29 @@ def main():
             print(f"  {name:20s}: {c['total']/1e6:>8.1f}M total, {c['trainable']/1e6:>8.1f}M trainable")
     print()
 
+    # ─── Training stages ──────────────────────────────────────────
+    train_cfg = config.get("training", {})
+    s1 = train_cfg.get("stage1", {})
+    s2 = train_cfg.get("stage2", {})
+    s3 = train_cfg.get("stage3", {})
+    print("Training plan:")
+    print(f"  Stage 1 ({s1.get('name', 'pretrain')}): "
+          f"{s1.get('epochs', 30)} epochs, LR={s1.get('lr', 3e-4)}, "
+          f"data={s1.get('data_sources', ['re_arc', 'agi1'])}")
+    print(f"  Stage 2 ({s2.get('name', 'finetune')}): "
+          f"{s2.get('epochs', 20)} epochs, LR={s2.get('lr', 1e-4)}, "
+          f"data={s2.get('data_sources', ['agi1', 'agi2'])}")
+    print(f"  Stage 3 ({s3.get('name', 'hard_focus')}): "
+          f"{s3.get('epochs', 10)} epochs, LR={s3.get('lr', 3e-5)}, "
+          f"data={s3.get('data_sources', ['agi1', 'agi2'])}, "
+          f"agi2_weight={s3.get('agi2_oversample', 2.0)}x")
+    print()
+
     # ─── Trainer ─────────────────────────────────────────────────
     trainer = Trainer(
         model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
         config=config,
-        checkpoint_dir=config["training"].get("checkpoint_dir", "checkpoints"),
+        checkpoint_dir=train_cfg.get("checkpoint_dir", "checkpoints"),
         use_wandb=args.wandb,
     )
 
@@ -97,7 +104,9 @@ def main():
     if args.push_to_hf:
         from arc_it.utils.hf_upload import upload_checkpoint_to_hf
 
-        best_ckpt = trainer.checkpoint_dir / "best_stage2.pt"
+        best_ckpt = trainer.checkpoint_dir / "best_stage3.pt"
+        if not best_ckpt.exists():
+            best_ckpt = trainer.checkpoint_dir / "best_stage2.pt"
         if not best_ckpt.exists():
             best_ckpt = trainer.checkpoint_dir / "best_stage1.pt"
 

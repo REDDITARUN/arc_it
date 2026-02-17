@@ -3,6 +3,7 @@
 
 data:
   repeat_factor: 1               # No repeat for dev
+  re_arc_samples_per_task: 5     # Fewer samples per RE-ARC task for dev
 
 training:
   batch_size: 4
@@ -13,6 +14,9 @@ training:
     epochs: 2
 
   stage2:
+    epochs: 2
+
+  stage3:
     epochs: 1
 
 ttt:

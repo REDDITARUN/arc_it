@@ -169,6 +169,49 @@ class TestARCTaskDataset:
         assert batch["num_demos"].shape == (2,)
 
 
+class TestREARCDataset:
+    """Test RE-ARC flat-list format loading and sampling."""
+
+    @pytest.fixture
+    def re_arc_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tasks_dir = Path(tmpdir) / "tasks"
+            tasks_dir.mkdir()
+            for i in range(2):
+                examples = [
+                    {"input": [[j % 10, (j+1) % 10], [(j+2) % 10, (j+3) % 10]],
+                     "output": [[(j+3) % 10, (j+2) % 10], [(j+1) % 10, j % 10]]}
+                    for j in range(20)
+                ]
+                with open(tasks_dir / f"task_{i:03d}.json", "w") as f:
+                    json.dump(examples, f)
+            yield tmpdir
+
+    def test_re_arc_loads(self, re_arc_dir):
+        ds = ARCTaskDataset(
+            data_roots=[re_arc_dir],
+            split="training", subset="train",
+            canvas_size=64, max_demos=5,
+            enable_augmentation=False,
+            re_arc_samples_per_task=10,
+        )
+        assert ds.num_tasks == 2
+        assert len(ds) == 20
+
+    def test_re_arc_sample_valid(self, re_arc_dir):
+        ds = ARCTaskDataset(
+            data_roots=[re_arc_dir],
+            split="training", subset="train",
+            canvas_size=64, max_demos=5,
+            enable_augmentation=False,
+            re_arc_samples_per_task=3,
+        )
+        sample = ds[0]
+        assert sample["demo_inputs"].shape == (5, 64, 64)
+        assert sample["target"].shape == (64, 64)
+        assert sample["task_name"].startswith("re_arc_")
+
+
 # ─── Evaluator Tests ────────────────────────────────────────────────
 
 class TestEvaluator:

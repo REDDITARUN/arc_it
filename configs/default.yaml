@@ -5,10 +5,12 @@
 data:
   arc_agi1_path: "References/ARC-AGI"
   arc_agi2_path: "References/ARC-AGI-2"
+  re_arc_path: "References/RE-ARC"       # michaelhodel/re-arc (400 tasks × 1000 examples)
   canvas_size: 64                # Fixed canvas for all grids (VARC-proven)
   num_colors: 12                 # 10 ARC + IGNORE + PAD
   max_grid_size: 30              # Max raw grid dimension
   max_demos: 5                   # Max demonstration pairs per task
+  re_arc_samples_per_task: 25    # Samples generated per RE-ARC task (random K+1 selection)
   repeat_factor: 1               # Use natural epochs with on-the-fly augmentation
 
   augmentation:
@@ -52,14 +54,22 @@ training:
   num_workers: 8                 # Mac override: 0
   gradient_clip: 1.0
 
-  # Two-stage schedule (no frozen encoder to warm up)
+  # Three-stage schedule with per-stage data sources
   stage1:
-    name: "full_training"
-    epochs: 50                   # Main training phase
-    lr: 3.0e-4                   # Higher LR since all 20M params are trainable
+    name: "pretrain"
+    data_sources: ["re_arc", "agi1"]  # RE-ARC + AGI-1 only (no AGI-2)
+    epochs: 30                   # Bulk pretraining on large synthetic data
+    lr: 3.0e-4
 
   stage2:
+    name: "finetune"
+    data_sources: ["agi1", "agi2"]    # Fine-tune on real ARC tasks
+    epochs: 20
+    lr: 1.0e-4
+
+  stage3:
     name: "hard_focus"
+    data_sources: ["agi1", "agi2"]    # Hard focus with AGI-2 oversampling
     epochs: 10
     lr: 3.0e-5
     agi2_oversample: 2.0         # 2x weight on AGI-2 tasks
@@ -89,5 +99,6 @@ ttt:
 # ─── Evaluation ─────────────────────────────────────────────────────
 evaluation:
   val_split_ratio: 0.1
+  val_data_sources: ["agi1", "agi2"]  # Always validate on real ARC
   metrics: ["pixel_accuracy", "grid_exact_match"]
   visualize_every_n_tasks: 50
