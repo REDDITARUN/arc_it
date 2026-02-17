@@ -51,18 +51,31 @@ else
     # Extract the pre-generated dataset from the zip
     if [ -f "re_arc.zip" ]; then
         echo "  Extracting re_arc.zip..."
-        # Use Python's zipfile (always available) as fallback for unzip
         python3 -c "
-import zipfile, shutil, os
+import zipfile, shutil, os, glob
+
 with zipfile.ZipFile('re_arc.zip', 'r') as z:
     z.extractall('../RE-ARC-tmp')
-# Find and move the tasks/ directory
+
+# Debug: show what was extracted
 for root, dirs, files in os.walk('../RE-ARC-tmp'):
-    if 'tasks' in dirs:
-        shutil.move(os.path.join(root, 'tasks'), '../RE-ARC/tasks')
-        break
+    depth = root.replace('../RE-ARC-tmp', '').count(os.sep)
+    if depth < 3:
+        indent = '  ' * (depth + 1)
+        print(f'{indent}{os.path.basename(root)}/ ({len(files)} files)')
+
+# Find all JSON files anywhere in the extracted content and move to tasks/
+os.makedirs('../RE-ARC/tasks', exist_ok=True)
+json_files = glob.glob('../RE-ARC-tmp/**/tasks/*.json', recursive=True)
+if not json_files:
+    # Fallback: find any JSON files
+    json_files = glob.glob('../RE-ARC-tmp/**/*.json', recursive=True)
+for f in json_files:
+    shutil.copy2(f, '../RE-ARC/tasks/' + os.path.basename(f))
+
 shutil.rmtree('../RE-ARC-tmp', ignore_errors=True)
-print(f'  Extracted {len(os.listdir(\"../RE-ARC/tasks\"))} task files')
+count = len(glob.glob('../RE-ARC/tasks/*.json'))
+print(f'  Extracted {count} task files to RE-ARC/tasks/')
 "
     else
         echo "  Warning: re_arc.zip not found, generating dataset..."
